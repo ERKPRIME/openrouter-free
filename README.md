@@ -26,9 +26,13 @@ $ opencode-free run "explain this repo"
 
 ## Install
 
-Requires opencode and Node 22.18+ (or Bun), on macOS or Linux. The code is TypeScript and ships as
-source: opencode loads the plugin directly, and Node 22.18+ or Bun runs the ranker without a build
-step.
+Requires **opencode 2** (`opencode --version` says 2.x; `install.sh` refuses 1.x) and Node 22.18+
+(or Bun), on macOS or Linux. The code is TypeScript and ships as source: opencode loads the plugin
+directly, and Node 22.18+ or Bun runs the ranker without a build step.
+
+If you upgrade opencode from 1.x to 2, run `./scripts/install.sh` again: the 1.x plugin does not load
+on 2, and the script moves the `plugin` entry of your `free.jsonc` to the `plugins` entry opencode 2
+reads.
 
 ```sh
 git clone https://github.com/lettland/opencode-free-router
@@ -52,7 +56,17 @@ opencode-free acp             # ACP agent (Zed, JetBrains, bb, ...)
 ```
 
 `opencode-free` is plain `opencode` with the free-router config layered on top via `OPENCODE_CONFIG`.
-Your normal `opencode` is unaffected.
+Your normal `opencode` is unaffected. opencode 2 commands normally talk to a shared background
+service that ignores that variable, so the wrapper runs each of them with its own private server
+(`--standalone`). Three consequences: `opencode-free service` (and `serve --service`) is refused;
+so are the commands that manage, restart or may auto-start that service (`debug`, `pair`, `mcp`,
+`plugin`, `upgrade`, `update`, `uninstall`), because it could come up with the free-router config and
+your provider keys, so run those as plain `opencode`; and a `run` message has to be quoted, because
+an unquoted word `service` in it is refused too:
+
+```sh
+opencode-free run "restart the service"    # not: opencode-free run restart the service
+```
 
 ## Which free models
 
@@ -108,8 +122,9 @@ An optional `ARTIFICIAL_ANALYSIS_API_KEY` in `ranker.env` adds Artificial Analys
 `rank.mts` writes `ranking.json`. The plugin re-runs it in the background whenever the file is older
 than `refreshHours` (6).
 
-1. It lists the models opencode can reach (`opencode models --verbose`) and keeps the ones that are free,
-   can call tools, and have at least 64k context.
+1. It lists the models opencode can reach (`opencode api --standalone model.list`) and keeps the ones that
+   are free, can call tools, are enabled, and have at least 64k context. A model with several price
+   tiers counts as free only if every tier is.
 2. It matches each model against the leaderboards by name. `mimo-v2.6-flash` never matches
    `mimo-v2.6-pro`, and AA's `ling-3-0-flash-fin` matches `ling-3.0-flash-fin-free`.
 3. Each source becomes a percentile. The score is the weighted mean over the sources that matched.
@@ -147,29 +162,46 @@ Everything is optional. Nested maps merge with the defaults key by key.
 | `stealthScore` | `0.95` | score for unbenchmarked stealth models |
 | `cooldownMinutes` | quota 360, rate 10, server 5, unavailable 1440 | how long a failed model sits out, unless `retry-after` says longer |
 | `maxSwitchesPerTurn` | `3` | failover budget per message |
-| `autoContinue` | `true` | continue the task automatically after a switch |
+| `autoContinue` | `true` | retry the failed turn on the next model; `false` fails the turn instead and the next message uses the new model |
 | `refreshHours` | `6` | re-rank when `ranking.json` is older than this |
 
 ## Failover in detail
 
-opencode keeps one model for a whole turn, including its own retries, which can wait hours on a
-`retry-after`. So when the plugin sees a quota or rate-limit retry, or an error saying the model is gone:
+opencode keeps one model for a whole turn, including its own retries, which can wait up to fifteen
+minutes on a rate limit. So when a request fails, the plugin looks at the error before opencode
+retries:
 
-1. The model goes on cooldown, until `retry-after` if the provider sends one, otherwise the default above.
+1. If the model is to blame, it goes on cooldown, until `retry-after` if the provider sends one,
+   otherwise the default above. A quota message, a removed model, or a refusal fails over at once; a
+   rate limit or a server error after the second try, or at once when the wait would be over a minute.
+   A context overflow, a cut-off answer or a content filter are not the model's fault and stay with
+   opencode.
 2. The session moves to the next-ranked model that isn't cooling down. If every model is cooling down, it
    uses the one that frees up first.
-3. The turn is aborted and continued on the new model:
-   - **opencode (TUI / run / serve):** a follow-up prompt, `[free-router] X hit its usage limit;
-     switched to Y. Continue the task from where it stopped.`
-   - **bb:** the same text, sent as a queued thread message so it's visible in the thread.
+3. opencode retries the same request on the new model straight away, in the same turn. The partial
+   answer of a request cut off half-way stays in the conversation and the new model continues from it.
 
-The partial output of the interrupted turn is lost. At most `maxSwitchesPerTurn` switches happen per message.
+At most `maxSwitchesPerTurn` switches happen per turn; after that the provider's error is shown at once
+instead of being waited out. With `autoContinue` off the turn fails and the next message runs on the
+new model.
+
+**A failover sends the whole conversation to the next free provider without asking.** Everything said
+in the session so far goes to the new model's provider, with that provider's data terms (see Privacy).
+
+Where you can see a switch: the model shown by the TUI, the model ACP clients report, `router.log`
+(`failover ...`) and `rank.mts --status`. There is no extra message in the conversation.
+
+**Choosing a model yourself ends routing for that session.** After `/model` to anything but `free/auto`
+the router leaves the session and its errors alone; `/model free/auto` hands it back.
 
 ## bb
 
 `./scripts/install.sh --bb` registers a custom ACP agent **Free (auto)** (provider `acp-free`) that
 runs `opencode-free acp`. Pick `free/auto` as its model. No other bb agent is touched. If an
 older install shows only "Agent default" as the model, re-run `./scripts/install.sh --bb`.
+
+A failover happens inside the running prompt, so bb sees one prompt answered by the new model; it
+no longer receives a queued "continue" message.
 
 ## Privacy
 
@@ -191,19 +223,19 @@ Don't point `free/auto` at confidential or client code. To narrow the pool, `ban
 ## Troubleshooting
 
 - `rank.mts --status` shows the ranking, warnings, active cooldowns, and which model each session uses.
-- `router.log` in the install directory records picks, failovers, continues and background refreshes.
-- `cache/candidates.json` holds what opencode reported for each model, which explains why a model was or
-  wasn't eligible.
+- `router.log` in the install directory records picks, failovers and background refreshes.
+- `cache/candidates.json` holds what opencode reported for each model (without headers, request
+  bodies and provider settings), which explains why a model was or wasn't eligible.
 
 ## Development
 
 ```sh
 npm ci --ignore-scripts       # compiler and type definitions, for npm run check only
 npm run check                 # type-check (TypeScript 7, strict)
-npm test                      # unit tests (no network, no opencode)
+npm test                      # unit tests (no network, no opencode 2)
 npm run test:coverage         # same, plus coverage/lcov.info (Node 26+)
 npm run lint:sh               # shellcheck
-./scripts/e2e-failover.sh     # real opencode + a fake 429 provider: failover, continue, stickiness
+./scripts/e2e-failover.sh     # real opencode 2 + a fake 429 provider: failover, stickiness, fail-fast
 ```
 
 Every push to `master` that changes shipped code (`src`, `bin`, `templates`, the install scripts,

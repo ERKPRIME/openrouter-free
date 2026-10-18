@@ -1,16 +1,17 @@
 #!/bin/sh
-# End-to-end failover check against a real opencode (not run in CI; needs opencode, node 22.18+, curl
-# and network access to OpenCode Zen's free models).
+# End-to-end failover check against a real opencode 2 (not run in CI; needs opencode 2, node 22.18+,
+# timeout or gtimeout, and network access to OpenCode Zen's free models).
 #   ./scripts/e2e-failover.sh
 # Ranks a fake provider that always answers 429 "per-day limit" first, then checks that
-#   1. the turn fails over to a real free model and is continued automatically,
+#   1. the turn fails over to a real free model and is retried there within the same run,
 #   2. the failed model is on cooldown,
-#   3. the next turn stays on the switched model (sticky) even after the cooldown is cleared.
+#   3. the next turn stays on the switched model (sticky) even after the cooldown is cleared,
+#   4. with no eligible model the run fails fast with a connection error instead of waiting.
 set -eu
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 fake_port="${FAKE_PORT:-18999}"
-oc_port="${OC_PORT:-18998}"
+limit=120
 work=$(mktemp -d "${TMPDIR:-/tmp}/free-router-e2e.XXXXXX")
 pids=""
 cleanup() {
@@ -19,28 +20,42 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-cp "$repo/src/plugin.ts" "$repo/src/lib.mts" "$repo/src/rank.mts" "$work/"
+if command -v timeout >/dev/null 2>&1; then tmo=timeout
+elif command -v gtimeout >/dev/null 2>&1; then tmo=gtimeout
+else
+  echo "missing prerequisite: timeout or gtimeout (macOS: brew install coreutils)" >&2
+  exit 1
+fi
+
+mkdir -p "$work/plugin"
+cp "$repo/src/plugin/index.ts" "$work/plugin/"
+cp "$repo/src/lib.mts" "$repo/src/rank.mts" "$work/"
 # The fake provider must count as free; everything else keeps the defaults.
 printf '{"freeTier":{"fakefree":["*"]}}\n' >"$work/config.json"
 cp "$repo/templates/pins.example.json" "$work/pins.json"
 
 cat >"$work/free.jsonc" <<EOF
 {
-  "\$schema": "https://opencode.ai/config.json",
-  "plugin": ["./plugin.ts"],
+  "plugins": ["./plugin"],
   "model": "free/auto",
-  "provider": {
-    "free": { "npm": "@ai-sdk/openai-compatible", "name": "Free", "options": { "baseURL": "http://127.0.0.1:9/v1", "apiKey": "x" },
-      "models": { "auto": { "name": "auto", "tool_call": true, "limit": { "context": 200000, "output": 32000 } } } },
-    "fakefree": { "npm": "@ai-sdk/openai-compatible", "name": "Fake", "options": { "baseURL": "http://127.0.0.1:$fake_port/v1", "apiKey": "x" },
-      "models": { "broken": { "name": "Broken Free", "tool_call": true, "limit": { "context": 200000, "output": 32000 } } } }
+  "providers": {
+    "free": { "name": "Free", "package": "@ai-sdk/openai-compatible", "settings": { "baseURL": "http://127.0.0.1:9/v1", "apiKey": "x" },
+      "models": { "auto": { "name": "auto", "capabilities": { "tools": true }, "limit": { "context": 200000, "output": 32000 } } } },
+    "fakefree": { "name": "Fake", "package": "@ai-sdk/openai-compatible", "settings": { "baseURL": "http://127.0.0.1:$fake_port/v1", "apiKey": "x" },
+      "models": { "broken": { "name": "Broken Free", "capabilities": { "tools": true }, "limit": { "context": 200000, "output": 32000 } } } }
   }
 }
 EOF
 
-# Ranking: the fake model first, then every live Zen free model.
-OPENCODE_CONFIG="$work/free.jsonc" FREE_ROUTER_RANKING=1 opencode models opencode | node -e '
-  const ids = require("fs").readFileSync(0, "utf8").split("\n").filter((l) => /^opencode\/\S+/.test(l))
+# opencode talks to its own private server (--standalone), which reads this config and directory.
+oc() { (cd "$work" && OPENCODE_CONFIG="$work/free.jsonc" FREE_ROUTER_DIR="$work" FREE_ROUTER_RANKING=1 "$tmo" "$limit" opencode "$@"); }
+
+# Ranking: the fake model first, then every live Zen model; the plugin drops the ones that are not free.
+# shellcheck disable=SC2016 # ${...} is a JS template literal
+oc api --standalone model.list | node -e '
+  const out = require("fs").readFileSync(0, "utf8")
+  const data = JSON.parse(out.slice(out.indexOf("{"))).data
+  const ids = data.filter((m) => m.providerID === "opencode").map((m) => `opencode/${m.id}`)
   const models = [{ id: "fakefree/broken", score: 9, reason: "e2e", sources: {} }, ...ids.map((id, i) => ({ id, score: 1 - i / 100, reason: "e2e", sources: {} }))]
   require("fs").writeFileSync(process.argv[1], JSON.stringify({ generatedAt: new Date().toISOString(), models }))
 ' "$work/ranking.json"
@@ -53,49 +68,31 @@ node -e '
   }).listen(Number(process.argv[1]), "127.0.0.1")
 ' "$fake_port" &
 pids="$pids $!"
+sleep 1
 
-OPENCODE_CONFIG="$work/free.jsonc" FREE_ROUTER_DIR="$work" FREE_ROUTER_RANKING=1 \
-  env -u BB_THREAD_ID -u BB_CLI opencode serve --port "$oc_port" --hostname 127.0.0.1 >"$work/serve.log" 2>&1 &
-pids="$pids $!"
-
-api="http://127.0.0.1:$oc_port"
-q="directory=$work"
-i=0
-until curl -sf "$api/session?$q" >/dev/null 2>&1; do
-  i=$((i + 1))
-  [ "$i" -lt 60 ] || { echo "FAIL: opencode serve did not start"; cat "$work/serve.log"; exit 1; }
-  sleep 0.5
-done
-
-sid=$(curl -sf -X POST "$api/session?$q" -H 'content-type: application/json' -d '{}' | node -pe 'JSON.parse(require("fs").readFileSync(0)).id')
-
-prompt() {
-  curl -sf -o /dev/null -X POST "$api/session/$sid/prompt_async?$q" -H 'content-type: application/json' \
-    -d "{\"model\":{\"providerID\":\"free\",\"modelID\":\"auto\"},\"parts\":[{\"type\":\"text\",\"text\":\"$1\"}]}"
+fail() {
+  echo "FAIL: $1"
+  cat "$work/router.log" 2>/dev/null || true
+  exit 1
 }
+# The model a session is stuck to, from the router's state file.
+pick_of() { node -e 'const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); console.log(s.sessions[process.argv[2]]?.model ?? "")' "$work/state.json" "$1"; }
 
-# Wait until an assistant message containing $1 exists; print "provider/model" of that message.
-wait_reply() {
-  i=0
-  while [ "$i" -lt 90 ]; do
-    # shellcheck disable=SC2016 # ${...} is a JS template literal
-    hit=$(curl -sf "$api/session/$sid/message?$q" | node -e '
-      const msgs = JSON.parse(require("fs").readFileSync(0, "utf8"))
-      const m = msgs.find((m) => m.info.role === "assistant" && m.parts.some((p) => p.type === "text" && (p.text || "").includes(process.argv[1])))
-      if (m) console.log(`${m.info.providerID}/${m.info.modelID}`)
-    ' "$1")
-    [ -n "$hit" ] && { echo "$hit"; return 0; }
-    i=$((i + 1))
-    sleep 1
-  done
-  return 1
-}
-
-prompt "Reply with exactly: e2e-one"
-first=$(wait_reply "e2e-one") || { echo "FAIL: no reply after failover"; cat "$work/router.log" 2>/dev/null; exit 1; }
-case "$first" in fakefree/*) echo "FAIL: answered by the fake model?"; exit 1 ;; esac
-grep -q '"fakefree/broken"' "$work/state.json" || { echo "FAIL: fake model not on cooldown"; exit 1; }
-echo "ok  failover: fakefree/broken -> $first (auto-continued)"
+oc run --standalone --format json "Reply with exactly: e2e-one" >"$work/one.json" || fail "turn 1 did not finish within ${limit}s"
+sid=$(node -e '
+  for (const line of require("fs").readFileSync(process.argv[1], "utf8").split("\n")) {
+    try {
+      const id = JSON.parse(line).sessionID
+      if (id) { console.log(id); break }
+    } catch {}
+  }
+' "$work/one.json")
+[ -n "$sid" ] || fail "no session id in the turn 1 output"
+grep -q 'e2e-one' "$work/one.json" || fail "no reply after failover"
+first=$(pick_of "$sid")
+case "$first" in "" | fakefree/*) fail "turn 1 was not answered by a real model (session on '$first')" ;; esac
+grep -q '"fakefree/broken"' "$work/state.json" || fail "fake model not on cooldown"
+echo "ok  failover: fakefree/broken -> $first (retried in the same run)"
 
 # Clear cooldowns: the fake model is #1 again, but the session must stay on its model.
 node -e '
@@ -103,8 +100,19 @@ node -e '
   s.cooldowns = {}
   require("fs").writeFileSync(f, JSON.stringify(s))
 ' "$work/state.json"
-prompt "Reply with exactly: e2e-two"
-second=$(wait_reply "e2e-two") || { echo "FAIL: no reply to second turn"; exit 1; }
-[ "$second" = "$first" ] || { echo "FAIL: second turn moved from $first to $second"; exit 1; }
+oc run --standalone --session "$sid" "Reply with exactly: e2e-two" >"$work/two.txt" || fail "turn 2 did not finish within ${limit}s"
+grep -q 'e2e-two' "$work/two.txt" || fail "no reply to second turn"
+second=$(pick_of "$sid")
+[ "$second" = "$first" ] || fail "second turn moved from $first to $second"
 echo "ok  sticky: second turn stayed on $second"
+
+# No eligible model: free/auto stays in place and the run must fail at once, not wait out a retry.
+printf '{"freeTier":{"fakefree":["*"]},"minContext":99999999}\n' >"$work/config.json"
+rm -f "$work/state.json"
+status=0
+oc run --standalone "Reply with exactly: e2e-three" >"$work/three.txt" 2>&1 || status=$?
+[ "$status" -ne 0 ] || fail "run succeeded with no eligible model"
+[ "$status" -ne 124 ] || fail "run did not fail fast with no eligible model"
+grep -Eqi '127\.0\.0\.1:9|ConnectionRefused|ECONNREFUSED' "$work/three.txt" || { cat "$work/three.txt"; fail "no connection error to the dead free/auto address"; }
+echo "ok  fail fast: exit $status with no eligible model"
 echo "PASS"

@@ -33,6 +33,15 @@ done
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing prerequisite: $1" >&2; exit 1; }; }
 need opencode
+# The plugin uses opencode 2's plugin API; 1.x loads nothing of it.
+oc_version=$(opencode --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)
+case "${oc_version:-}" in
+  [2-9].* | [1-9][0-9].*) ;;
+  *)
+    echo "$(command -v opencode) is opencode ${oc_version:-of unknown version}: opencode 2 or newer is required (put it first on PATH)" >&2
+    exit 1
+    ;;
+esac
 # rank.mts is TypeScript: node runs it as is from 22.18 on. The plugin starts it with the first
 # node on PATH, so an older node there is an error even when bun is installed too.
 if command -v node >/dev/null 2>&1; then
@@ -49,9 +58,12 @@ fi
 mkdir -p "$dir"
 dir=$(cd "$dir" && pwd)
 
-# Code: always replaced. Older installs have it as plain JavaScript under other names.
-cp "$repo/src/plugin.ts" "$repo/src/lib.mts" "$repo/src/rank.mts" "$dir/"
-rm -f "$dir/plugin.js" "$dir/lib.mjs" "$dir/rank.mjs"
+# Code: always replaced. opencode 2 loads the plugin from a directory. Older installs have the plugin
+# as plugin.ts (or plain JavaScript under other names) next to the other files.
+mkdir -p "$dir/plugin"
+cp "$repo/src/plugin/index.ts" "$dir/plugin/index.ts"
+cp "$repo/src/lib.mts" "$repo/src/rank.mts" "$dir/"
+rm -f "$dir/plugin.ts" "$dir/plugin.js" "$dir/lib.mjs" "$dir/rank.mjs"
 sed "s|@FREE_ROUTER_DIR@|$dir|" "$repo/bin/opencode-free" >"$dir/opencode-free"
 chmod 755 "$dir/opencode-free"
 
@@ -65,13 +77,20 @@ copy_once() {
   fi
 }
 copy_once "$repo/templates/free.jsonc" "$dir/free.jsonc"
-# The one edit ever made to an existing free.jsonc: its plugin entry follows the rename. Written
-# back in place, so a free.jsonc symlinked from elsewhere stays a symlink.
-if grep -q '"\./plugin\.js"' "$dir/free.jsonc"; then
-  sed 's|"\./plugin\.js"|"./plugin.ts"|' "$dir/free.jsonc" >"$dir/free.jsonc.tmp"
+# The one edit ever made to an existing free.jsonc: its plugin entry follows the move to opencode 2's
+# "plugins" directory entry. Written back in place, so a free.jsonc symlinked from elsewhere stays a
+# symlink. Comment lines are neither rewritten nor counted.
+old_entry='"plugin"[[:space:]]*:[[:space:]]*\[[[:space:]]*"\./plugin\.[tj]s"[[:space:]]*\]'
+active() { grep -v '^[[:space:]]*//' "$dir/free.jsonc" || true; }
+if active | grep -Eq "$old_entry"; then
+  sed "/^[[:space:]]*\/\//!s|$old_entry|\"plugins\": [\"./plugin\"]|" "$dir/free.jsonc" >"$dir/free.jsonc.tmp"
   cat "$dir/free.jsonc.tmp" >"$dir/free.jsonc"
   rm -f "$dir/free.jsonc.tmp"
-  echo "updated  $dir/free.jsonc (plugin.js -> plugin.ts)"
+  echo "updated  $dir/free.jsonc (plugin -> plugins)"
+fi
+if active | grep -Eq '"plugin"[[:space:]]*:' || ! active | grep -Eq '"plugins"[[:space:]]*:[^]]*"\./plugin"'; then
+  echo "installed the code, but $dir/free.jsonc does not load it: replace its \"plugin\" entry with \"plugins\": [\"./plugin\"] (on one line), then run install.sh again" >&2
+  exit 1
 fi
 copy_once "$repo/templates/config.example.json" "$dir/config.json"
 copy_once "$repo/templates/pins.example.json" "$dir/pins.json"

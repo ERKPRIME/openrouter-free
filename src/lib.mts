@@ -1,4 +1,4 @@
-// Pure helpers shared by rank.mts (node) and plugin.ts (opencode/bun). No dependencies.
+// Pure helpers shared by rank.mts (node) and plugin/index.ts (opencode/bun). No dependencies.
 import fs from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -15,18 +15,17 @@ export interface ModelRef {
 export const VIRTUAL: ModelRef = { providerID: "free", modelID: "auto" }
 export const isVirtual = (m: ModelRef) => m.providerID === VIRTUAL.providerID && m.modelID === VIRTUAL.modelID
 
-// A model as `opencode models --verbose` and opencode's provider list report it; only what the
-// router reads. Older opencode versions put the tool-call flag in `tool_call`.
+// A model as decodeModel reads it from opencode's model list; only what the router needs.
 export interface ModelInfo {
   id: string
   providerID: string
   name?: string | undefined
   status?: string | undefined
+  enabled?: boolean | undefined
   release_date?: string | undefined
   cost?: { input: number; output: number } | undefined
   limit?: { context: number } | undefined
   capabilities?: { toolcall: boolean } | undefined
-  tool_call?: boolean | undefined
 }
 
 // ---------- JSON ----------
@@ -63,26 +62,45 @@ export function entries<T>(v: unknown, decode: (x: unknown) => T | undefined): R
   return out
 }
 
+// A model has one price per context tier. It counts as free only when every tier is zero: the
+// highest-priced tier is reported, so a paid long-context tier is never mistaken for free. No tiers,
+// or one that does not decode, leaves the cost unknown (not free).
+function decodeCost(v: unknown) {
+  const tiers = asArray(v).map((x) => {
+    const c = asObject(x)
+    const input = optNumber(c.input)
+    const output = optNumber(c.output)
+    return input === undefined || output === undefined ? undefined : { input, output }
+  })
+  const priced = tiers.filter((t) => t !== undefined)
+  if (!priced.length || priced.length < tiers.length) return undefined
+  return priced.reduce((a, b) => (b.input + b.output > a.input + a.output ? b : a))
+}
+
+// opencode reports the release time in milliseconds.
+function decodeReleased(v: unknown) {
+  const released = optNumber(v)
+  const date = released ? new Date(released) : undefined
+  return date && !Number.isNaN(date.getTime()) ? date.toISOString() : undefined
+}
+
 export function decodeModel(v: unknown): ModelInfo | undefined {
   const m = asObject(v)
   const id = optString(m.id)
   const providerID = optString(m.providerID)
   if (id === undefined || providerID === undefined) return undefined
-  const cost = asObject(m.cost)
-  const input = optNumber(cost.input)
-  const output = optNumber(cost.output)
   const context = optNumber(asObject(m.limit).context)
-  const toolcall = optBoolean(asObject(m.capabilities).toolcall)
+  const toolcall = optBoolean(asObject(m.capabilities).tools)
   return {
     id,
     providerID,
     name: optString(m.name),
     status: optString(m.status),
-    release_date: optString(m.release_date),
-    cost: input === undefined || output === undefined ? undefined : { input, output },
+    enabled: optBoolean(m.enabled),
+    release_date: decodeReleased(asObject(m.time).released),
+    cost: decodeCost(m.cost),
     limit: context === undefined ? undefined : { context },
     capabilities: toolcall === undefined ? undefined : { toolcall },
-    tool_call: optBoolean(m.tool_call),
   }
 }
 
@@ -267,8 +285,8 @@ export function isEligible(model: ModelInfo, cfg: Config, pins: Pick<Pins, "ban"
   if (model.providerID === "openrouter" && model.id.startsWith("openrouter/")) return false
   if (pins.ban.includes(id)) return false
   if (NON_CHAT.test(model.id)) return false
-  if (model.status === "deprecated") return false
-  if (!(model.capabilities?.toolcall ?? model.tool_call)) return false
+  if (model.status === "deprecated" || model.enabled === false) return false
+  if (!model.capabilities?.toolcall) return false
   if ((model.limit?.context ?? 0) < cfg.minContext) return false
   return isFree(model, cfg)
 }
@@ -427,6 +445,9 @@ export const rankedIds = (ranking: unknown) => list(asObject(ranking).models, (m
 const RE_QUOTA = /free usage exceeded|usage limit|quota|exhausted|insufficient|credits|limit reached|daily limit|per[- ]day|freeusagelimit/i
 const RE_RATE = /\b429\b|rate.?limit|too many requests|rate increased too quickly/i
 const RE_SERVER = /\b5\d\d\b|overloaded|unavailable|internal|server.?error|provider returned error|terminated|fetch failed|econn|etimedout|socket/i
+// A request the model is not at fault for: the conversation is too long, the output was cut or a filter refused it.
+// A user abort never reaches the retry hook, and a transport error that says "aborted" is a provider fault.
+const RE_IGNORE = /context.?overflow|context.?(length|window)|maximum context|prompt is too long|input is too long|output.?length|content.?(filter|policy)/i
 const RE_GONE = /freetiererror|free tier can only|model.?not.?found|no such model|does not exist|unknown model|not supported|no endpoints found|decommissioned|deprecated|\b404\b/i
 
 export type FailureClass = CooldownClass | "auth"
@@ -439,58 +460,59 @@ export interface Failover {
   scope?: "provider"
 }
 
-export type RetryDecision = Failover | { action: "wait"; klass: "rate" | "server" | "other" }
-export type ErrorDecision = Failover | { action: "ignore" }
+export type FailureDecision = Failover | { action: "wait" } | { action: "ignore" }
 
-// The retry status opencode reports while it retries a request.
-export interface RetryInfo {
-  message?: string | undefined
-  attempt?: number | undefined
-  next?: number | undefined
+// A failed model request as opencode's retry hook reports it. `attempt` counts from the last
+// switch and `delay` is the wait opencode would impose before retrying (ms, 0 if it will not retry).
+export interface FailureInfo {
+  type: string
+  message: string
+  status?: number | undefined
+  body?: string | undefined
+  attempt: number
+  delay: number
 }
 
-// A session.error payload: one of opencode's error types, or anything shaped like one.
-export interface ErrorInfo {
-  name?: string | undefined
-  data?: JsonObject | undefined
-}
-
-// Retry status from session.status: decide whether to abandon this model now.
-export function classifyRetry({ message = "", attempt = 1, next = 0 }: RetryInfo, cfg: Config, now = Date.now()): RetryDecision {
-  const wait = Math.max(0, next - now)
-  const min = (k: CooldownClass) => cfg.cooldownMinutes[k] * 60e3
-  if (RE_QUOTA.test(message)) return { action: "failover", klass: "quota", cooldownMs: Math.max(wait, min("quota")) }
-  if (RE_RATE.test(message)) {
-    if (wait > 60e3 || attempt >= 2) return { action: "failover", klass: "rate", cooldownMs: Math.max(wait, min("rate")) }
-    return { action: "wait", klass: "rate" }
-  }
-  if (RE_SERVER.test(message)) {
-    if (attempt >= 2) return { action: "failover", klass: "server", cooldownMs: Math.max(wait, min("server")) }
-    return { action: "wait", klass: "server" }
-  }
-  if (attempt >= 3) return { action: "failover", klass: "server", cooldownMs: min("server") }
-  return { action: "wait", klass: "other" }
-}
-
-// Terminal session.error: decide whether it is the model's fault (switch) or not (leave alone).
-export function classifyError(error: ErrorInfo | undefined, cfg: Config): ErrorDecision {
-  if (!error) return { action: "ignore" }
-  const name = error.name ?? ""
-  if (/MessageAbortedError|ContextOverflow|MessageOutputLength/i.test(name)) return { action: "ignore" }
-  const d = error.data ?? {}
-  const text = `${name} ${optString(d.message) ?? ""} ${optString(d.responseBody) ?? ""}`
-  const status = optNumber(d.statusCode)
-  const min = (k: CooldownClass) => cfg.cooldownMinutes[k] * 60e3
-  if (/ProviderAuthError/i.test(name) || status === 401 || status === 403)
-    return { action: "failover", klass: "auth", scope: "provider", cooldownMs: min("unavailable") }
-  if (status === 404 || RE_GONE.test(text)) return { action: "failover", klass: "unavailable", cooldownMs: min("unavailable") }
+// What kind of fault a failure is, or undefined when nothing identifies it. `type` is only a hint:
+// opencode 2.0 was seen reporting provider.auth, provider.rate-limit, provider.invalid-request,
+// provider.internal and provider.transport. provider.quota, provider.timeout and provider.no-route
+// are unverified, so the status and the message decide whenever the type is unknown.
+function failureKind({ type, message, status, body = "" }: FailureInfo) {
+  const text = `${message} ${body}`
+  if (status === 401 || status === 403 || type === "provider.auth") return "auth"
   // 402: a free-plan account asking for a model it cannot pay for. Model-scoped, like a removal.
-  if (status === 402 || /payment required/i.test(text)) return { action: "failover", klass: "unavailable", cooldownMs: min("unavailable") }
-  if (RE_QUOTA.test(text)) return { action: "failover", klass: "quota", cooldownMs: min("quota") }
-  if (status === 429 || RE_RATE.test(text)) return { action: "failover", klass: "rate", cooldownMs: min("rate") }
-  if ((status !== undefined && status >= 500 && status < 600) || RE_SERVER.test(text))
-    return { action: "failover", klass: "server", cooldownMs: min("server") }
-  return { action: "ignore" }
+  // A removal message only counts without a status or with a client error: a retried 5xx that mentions
+  // a missing model is a transient provider fault.
+  const clientError = status === undefined || (status >= 400 && status < 500 && status !== 429)
+  if (status === 404 || status === 402 || /payment required/i.test(text) || (clientError && RE_GONE.test(text))) return "unavailable"
+  if (RE_QUOTA.test(text) || type === "provider.quota") return "quota"
+  if (status === 429 || type === "provider.rate-limit" || RE_RATE.test(text)) return "rate"
+  if ((status !== undefined && status >= 500 && status < 600) || /^provider\.(internal|transport|timeout|no-route)$/.test(type) || RE_SERVER.test(text)) return "server"
+  return undefined
+}
+
+// Decide whether the model is to blame (switch) or not (leave opencode's own retry alone).
+export function classifyFailure(f: FailureInfo, cfg: Config): FailureDecision {
+  if (RE_IGNORE.test(`${f.type} ${f.message}`)) return { action: "ignore" }
+  const wait = Math.max(0, f.delay) || 0
+  const min = (k: CooldownClass) => cfg.cooldownMinutes[k] * 60e3
+  const fail = (klass: CooldownClass): FailureDecision => ({ action: "failover", klass, cooldownMs: Math.max(wait, min(klass)) })
+  switch (failureKind(f)) {
+    case "auth":
+      return { action: "failover", klass: "auth", scope: "provider", cooldownMs: min("unavailable") }
+    case "unavailable":
+      return { action: "failover", klass: "unavailable", cooldownMs: min("unavailable") }
+    case "quota":
+      return fail("quota")
+    // A rate limit waits for opencode's retry unless the wait is long or it repeats.
+    case "rate":
+      return wait > 60e3 || f.attempt >= 2 ? fail("rate") : { action: "wait" }
+    case "server":
+      return f.attempt >= 2 ? fail("server") : { action: "wait" }
+    // An error nobody recognises gives up eventually.
+    default:
+      return f.attempt >= 3 ? { action: "failover", klass: "server", cooldownMs: min("server") } : { action: "wait" }
+  }
 }
 
 export function coolingUntil(state: Pick<State, "cooldowns">, id: string, now = Date.now()) {

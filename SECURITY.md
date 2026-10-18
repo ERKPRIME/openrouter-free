@@ -27,5 +27,9 @@ GitHub Security Advisories:
   endpoints log usage, and "contributor" models train on prompts. OpenRouter's free providers may keep
   prompts. Don't use `free/auto` for confidential code. Narrow the pool with `pins.json` → `ban`
   or `excludeProviders`.
+- **Logs.** `router.log` and `state.json` (both mode 0600) keep up to 200 characters of the error
+  message a provider returned when a model failed. Some providers put a masked fragment of the API
+  key in such a message. The response body is only read to classify the failure, never kept. Keep
+  that in mind before sharing either file.
 - **Remote data** (LMArena, Artificial Analysis, OpenRouter) is parsed as JSON and used only
   for scoring; it is never executed.

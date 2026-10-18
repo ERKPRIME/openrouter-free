@@ -4,36 +4,42 @@ import { test } from "node:test"
 import type { TestContext } from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs"
-import os from "node:os"
 import path from "node:path"
 import { spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { asArray, asObject, list, optString, readJSON } from "../src/lib.mts"
+import { tempWithOpencode } from "./fixtures/fake-opencode.ts"
 
 const RANK = fileURLToPath(new URL("../src/rank.mts", import.meta.url))
 const STUB = new URL("./fixtures/fetch-stub.ts", import.meta.url).href
 
 const FAKE_OPENCODE = `#!/bin/sh
 printf '%s|%s|%s\\n' "$OPENCODE_CONFIG" "$FREE_ROUTER_RANKING" "$FOO_KEY" > "$FREE_ROUTER_DIR/opencode-env"
+printf '%s\\n' "$*" > "$FREE_ROUTER_DIR/opencode-argv"
 if [ -n "$FAKE_OPENCODE_FAIL" ]; then echo "boom" >&2; exit 1; fi
 cat "$FREE_ROUTER_DIR/models.txt"
 `
 
+// A model.list entry, with the fields that can hold credentials filled in.
 const model = (providerID: string, id: string, extra: Record<string, unknown> = {}) => ({
   providerID,
   id,
   name: id,
   status: "active",
-  cost: { input: 0, output: 0 },
-  limit: { context: 200000 },
-  capabilities: { toolcall: true },
+  enabled: true,
+  cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
+  limit: { context: 200000, output: 4096 },
+  capabilities: { tools: true },
+  headers: { authorization: "Bearer sk-secret-header" },
+  settings: { apiKey: "sk-secret-setting" },
+  variants: [{ id: "high", headers: { "x-key": "sk-secret-variant" }, body: { reasoning: "high" }, settings: { token: "sk-secret-variant" } }],
   ...extra,
 })
 
-// `opencode models --verbose` output, plus one block that is not valid JSON.
-const modelsOut = (...ms: ReturnType<typeof model>[]) => ms.map((m) => `${m.providerID}/${m.id}\n${JSON.stringify(m, null, 2)}\n`).join("") + "opencode/broken\n{\n  nope\n}\n"
+// `opencode api model.list` output: one JSON object, between log lines, with one entry that is not a model.
+const modelList = (...ms: ReturnType<typeof model>[]) => `starting\n${JSON.stringify({ location: { directory: "/x" }, data: [...ms, "junk"] })}\nbye\n`
 
-const MODELS = modelsOut(model("opencode", "big-free", { name: "Big Model" }), model("opencode", "space-bunny-free"), model("openai", "paid", { cost: { input: 1, output: 1 } }))
+const MODELS = modelList(model("opencode", "big-free", { name: "Big Model" }), model("opencode", "space-bunny-free"), model("openai", "paid", { cost: [{ input: 1, output: 1, cache: { read: 0, write: 0 } }] }))
 
 const overall = (model_name: string, field: string, value: number) => ({ row: { category: "overall", model_name, [field]: value } })
 const ROUTES = [
@@ -50,13 +56,7 @@ const ROUTES = [
   { match: "openrouter.ai/api/v1/models", body: { data: [{ id: "stealth/space-bunny-alpha", name: "Space Bunny Alpha" }, { id: "stealth/quiet-fox", name: "" }, { id: "meta/llama" }] } },
 ]
 
-function setup(t: TestContext) {
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "free-router-rank-")))
-  fs.mkdirSync(path.join(dir, "bin"))
-  fs.writeFileSync(path.join(dir, "bin", "opencode"), FAKE_OPENCODE, { mode: 0o755 })
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
-  return dir
-}
+const setup = (t: TestContext) => tempWithOpencode(t, "free-router-rank-", FAKE_OPENCODE)
 
 function run(dir: string, args: string[] = [], { routes = ROUTES, models = MODELS, env = {} }: { routes?: unknown[]; models?: string; env?: Record<string, string> } = {}) {
   fs.writeFileSync(path.join(dir, "routes.json"), JSON.stringify(routes))
@@ -84,7 +84,8 @@ test("refresh ranks eligible models from every source, then serves from cache", 
   assert.match(r.stdout, /^warning: arena_text: 500 Server Error for https:\/\/datasets-server\.huggingface\.co\/rows \(no previous copy\)$/m)
   assert.equal(fs.readFileSync(path.join(dir, "opencode-env"), "utf8"), `${path.join(dir, "free.jsonc")}|1|abc\n`, "config, recursion guard and providers.env reach opencode")
 
-  assert.equal(readRanking(dir).candidatesSeen, 3, "unparsable model blocks are skipped")
+  assert.equal(fs.readFileSync(path.join(dir, "opencode-argv"), "utf8"), "api --standalone model.list\n")
+  assert.equal(readRanking(dir).candidatesSeen, 3, "entries that are not models are skipped")
   const models = rankedModels(dir)
   assert.deepEqual(
     models.map((m) => [m.id, m.reason]),
@@ -94,7 +95,11 @@ test("refresh ranks eligible models from every source, then serves from cache", 
     ],
   )
   assert.equal(models[0]?.score, 1)
-  assert.equal(asArray(readJSON(path.join(dir, "cache", "candidates.json"))).length, 3)
+  const kept = asArray(readJSON(path.join(dir, "cache", "candidates.json")))
+  assert.equal(kept.length, 3)
+  assert.ok(!JSON.stringify(kept).includes("sk-secret"), "no credential reaches the cache")
+  assert.deepEqual(Object.keys(asObject(kept[0])).filter((k) => ["headers", "body", "settings"].includes(k)), [])
+  assert.deepEqual(asObject(asArray(asObject(kept[0]).variants)[0]), { id: "high" }, "variants lose theirs too")
   assert.deepEqual(
     list(asObject(readJSON(path.join(dir, "cache", "arena_agent.json"))).data, (r) => optString(asObject(r).name)),
     ["big-model", "small-model", "mid-model"],
@@ -120,7 +125,7 @@ test("refresh without an AA key or eligible models still writes a ranking and fr
   const lock = path.join(dir, "rank.lock")
   fs.writeFileSync(lock, "1")
 
-  const r = run(dir, ["--lock", lock], { models: modelsOut(model("openai", "paid", { cost: { input: 1, output: 1 } })) })
+  const r = run(dir, ["--lock", lock], { models: modelList(model("openai", "paid", { cost: [{ input: 1, output: 1, cache: { read: 0, write: 0 } }] })) })
   assert.equal(r.status, 0, r.stderr)
   assert.match(r.stdout, /^ranked 0 free models; top: none$/m)
   assert.match(r.stdout, /^warning: aa: ARTIFICIAL_ANALYSIS_API_KEY not set, Artificial Analysis scores skipped$/m)
@@ -136,13 +141,25 @@ test("refresh fails cleanly when opencode fails or is missing", (t) => {
   fs.writeFileSync(lock, "1")
   const failed = run(dir, ["--lock", lock], { env: { FAKE_OPENCODE_FAIL: "1" } })
   assert.equal(failed.status, 1)
-  assert.equal(failed.stderr, "rank failed: opencode models failed: boom\n\n", "opencode's stderr, verbatim")
+  assert.equal(failed.stderr, "rank failed: opencode model.list failed: boom\n\n", "opencode's stderr, verbatim")
   assert.ok(!fs.existsSync(lock), "lock is released on failure too")
 
   const missing = run(dir, [], { env: { PATH: path.join(dir, "nowhere") } })
   assert.equal(missing.status, 1)
-  assert.match(missing.stderr, /^rank failed: opencode models failed: spawnSync opencode ENOENT$/m)
+  assert.match(missing.stderr, /^rank failed: opencode model.list failed: spawnSync opencode ENOENT$/m)
   assert.ok(!fs.existsSync(path.join(dir, "ranking.json")))
+})
+
+test("refresh reads the model list however opencode prints it", (t) => {
+  const dir = setup(t)
+  const pretty = `log line\n${JSON.stringify({ data: [model("opencode", "big-free")] }, null, 2)}\nlog line\n`
+  const ok = run(dir, [], { models: pretty })
+  assert.equal(ok.status, 0, ok.stderr)
+  assert.match(ok.stdout, /^ranked 1 free models; top: opencode\/big-free$/m)
+
+  const none = run(dir, [], { models: "nothing to see\n" })
+  assert.equal(none.status, 1)
+  assert.equal(none.stderr, "rank failed: opencode model.list failed: no model list in its output\n")
 })
 
 test("--status prints the ranking, cooldowns and recent sessions", (t) => {

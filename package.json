@@ -33,8 +33,7 @@
     "e2e": "./scripts/e2e-failover.sh"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.18.32",
-    "@opencode-ai/sdk": "^1.18.32",
+    "@opencode/plugin": "2.0.32",
     "@types/node": "^22.20.4",
     "typescript": "^7.0.2"
   }

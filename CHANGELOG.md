@@ -6,6 +6,36 @@ release. A `[minor]` or `[major]` marker in a commit subject picks the bump; oth
 
 ## Unreleased
 
+- **Breaking: opencode 2 only.** The plugin is ported to opencode 2's plugin API; opencode 1.x is no
+  longer supported and `install.sh` refuses it. After upgrading opencode, **re-run `install.sh`**: it
+  installs the plugin as `plugin/index.ts`, removes the old `plugin.ts`, and rewrites the one-line
+  `"plugin": ["./plugin.ts"]` of an existing `free.jsonc` to `"plugins": ["./plugin"]`. A multi-line
+  entry is left alone and the install stops with the edit to make. The template now uses opencode 2's
+  config keys (`providers`, `package`, `settings`, `capabilities`); an existing `free.jsonc` with the
+  old provider block keeps working.
+- Failover is now done inside opencode's own retry: the plugin switches the session's model and
+  opencode retries the request on it at once, in the same turn. The abort / wait-for-idle / "continue"
+  prompt, the status polling and the bb queued message are gone, and so is the `[free-router]` message
+  in the conversation. `autoContinue: false` now means the turn fails and the next message uses the
+  new model. When the switch budget (`maxSwitchesPerTurn`) is spent or no model is left, the provider's
+  error is shown at once instead of waiting out a long retry.
+- A session is routed while it is on `free/auto` or on the model the router picked for it (kept in the
+  session's metadata as well as in `state.json`); choosing another model with `/model` ends routing
+  for that session, `/model free/auto` brings it back. Child sessions and forks follow the pick of
+  the session they came from.
+- `opencode-free` runs every command that can with its own server (`--standalone`), since opencode 2's
+  shared background service ignores `OPENCODE_CONFIG`. It refuses the `service` command, `serve
+  --service`, an unquoted `service` word in a message, and the commands that manage or may
+  auto-start the service (`debug`, `pair`, `mcp`, `plugin`, `upgrade`, `update`, `uninstall`): run
+  those as plain `opencode`, so the service never comes up with the router's config and keys.
+- The ranker lists models with `opencode api --standalone model.list`. A model counts as free only if
+  every one of its price tiers is zero, and disabled models are skipped. `cache/candidates.json` no
+  longer keeps headers, request bodies or provider settings.
+- `router.log` and `state.json` keep up to 200 characters of a provider's error message, never its
+  response body (SECURITY.md).
+- To go back to opencode 1.x: restore `"plugin": ["./plugin.ts"]` in `free.jsonc`, run the `install.sh`
+  of v0.1.2, then `rm -f "$dir/plugin/index.ts"; rmdir "$dir/plugin"` in the install directory.
+
 ## 0.1.2 — 2026-09-30
 
 - Split the plugin's server closure into named factories

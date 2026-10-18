@@ -1,0 +1,219 @@
+[
+  {
+    "id": "nemotron-3.5-super-vl-free",
+    "modelID": "nemotron-3.5-super-vl-free",
+    "providerID": "opencode",
+    "family": "nemotron-free",
+    "name": "Nemotron 3.5 Super VL Free",
+    "compatibility": {
+      "reasoningField": "reasoning_content"
+    },
+    "package": "@opencode/ai/providers/openai-compatible",
+    "capabilities": {
+      "tools": true,
+      "input": [
+        "text",
+        "image"
+      ],
+      "output": [
+        "text"
+      ],
+      "temperature": true
+    },
+    "variants": [
+      {
+        "id": "none"
+      },
+      {
+        "id": "minimal"
+      },
+      {
+        "id": "low"
+      },
+      {
+        "id": "medium"
+      },
+      {
+        "id": "high"
+      },
+      {
+        "id": "xhigh"
+      }
+    ],
+    "time": {
+      "released": 1792022400000
+    },
+    "cost": [
+      {
+        "input": 0,
+        "output": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    ],
+    "status": "active",
+    "enabled": true,
+    "limit": {
+      "context": 1048576,
+      "input": 1048576,
+      "output": 131072
+    }
+  },
+  {
+    "id": "claude-haiku-5-5",
+    "modelID": "claude-haiku-5-5",
+    "providerID": "opencode",
+    "family": "claude-haiku",
+    "name": "Claude Haiku 5.5",
+    "package": "@opencode/ai/providers/anthropic",
+    "capabilities": {
+      "tools": true,
+      "input": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "output": [
+        "text"
+      ],
+      "temperature": false
+    },
+    "variants": [
+      {
+        "id": "none"
+      },
+      {
+        "id": "low"
+      },
+      {
+        "id": "medium"
+      },
+      {
+        "id": "high"
+      },
+      {
+        "id": "xhigh"
+      },
+      {
+        "id": "max"
+      }
+    ],
+    "time": {
+      "released": 1791331200000
+    },
+    "cost": [
+      {
+        "input": 0.1,
+        "output": 0.5,
+        "cache": {
+          "read": 0.01,
+          "write": 0.125
+        }
+      },
+      {
+        "tier": {
+          "type": "context",
+          "size": 100000
+        },
+        "input": 0.5,
+        "output": 2.5,
+        "cache": {
+          "read": 0.05,
+          "write": 0.625
+        }
+      }
+    ],
+    "status": "active",
+    "enabled": true,
+    "limit": {
+      "context": 1000000,
+      "output": 128000
+    }
+  },
+  {
+    "id": "mistral-large-4",
+    "modelID": "mistral-large-4",
+    "providerID": "opencode",
+    "family": "mistral-large",
+    "name": "Mistral Large 4",
+    "package": "@opencode/ai/providers/mistral",
+    "capabilities": {
+      "tools": true,
+      "input": [
+        "text",
+        "image"
+      ],
+      "output": [
+        "text"
+      ],
+      "temperature": true
+    },
+    "variants": [
+      {
+        "id": "none"
+      },
+      {
+        "id": "high"
+      }
+    ],
+    "time": {
+      "released": 1791244800000
+    },
+    "cost": [
+      {
+        "input": 0.68,
+        "output": 2.09,
+        "cache": {
+          "read": 0.07,
+          "write": 0
+        }
+      }
+    ],
+    "status": "active",
+    "enabled": true,
+    "limit": {
+      "context": 524288,
+      "output": 262144
+    }
+  },
+  {
+    "id": "auto",
+    "modelID": "auto",
+    "providerID": "free",
+    "name": "auto",
+    "package": "@opencode/ai/providers/openai-compatible",
+    "capabilities": {
+      "tools": true,
+      "input": [
+        "text",
+        "image"
+      ],
+      "output": [
+        "text"
+      ]
+    },
+    "variants": [
+      {
+        "id": "low"
+      },
+      {
+        "id": "medium"
+      },
+      {
+        "id": "high"
+      }
+    ],
+    "time": {
+      "released": 0
+    },
+    "cost": [],
+    "status": "active",
+    "enabled": true,
+    "limit": {
+      "context": 200000,
+      "output": 32000
+    }
+  }
+]

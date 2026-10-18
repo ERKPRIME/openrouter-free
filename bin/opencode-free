@@ -1,6 +1,13 @@
 #!/bin/sh
 # opencode with the free-router config: `opencode-free`, `opencode-free run ...`, `opencode-free acp`.
 # install.sh replaces @FREE_ROUTER_DIR@ with the install directory.
+#
+# opencode 2 commands connect to a shared background service that ignores OPENCODE_CONFIG, so
+# every command that can run its own server gets --standalone. `acp` and `serve` start their own
+# server and read OPENCODE_CONFIG already. The service itself is refused, and so are the commands
+# that manage, restart or may auto-start it (`debug`, `pair`, `mcp`, `plugin`, `upgrade`, `update`,
+# `uninstall`): it could come up with this config and the provider keys exported. Run those as plain
+# `opencode`.
 set -eu
 
 dir="${FREE_ROUTER_DIR:-@FREE_ROUTER_DIR@}"
@@ -27,4 +34,81 @@ fi
 FREE_ROUTER_DIR="$dir"
 OPENCODE_CONFIG="$dir/free.jsonc"
 export FREE_ROUTER_DIR OPENCODE_CONFIG
+
+# Flags (from `opencode --help` and each subcommand's) whose next word is their value, not a subcommand.
+takes_value() {
+  case "$1" in
+    --log-level | --completions | --server | --session | -s | --prompt | --model | -m | --agent | --format | --file | -f | --title | --data | -d | --header | -H | --param | --hostname | --port | --cors | --days | --year | --project | --limit | --url | --method | --replay-limit) return 0 ;;
+  esac
+  return 1
+}
+
+refuse_command() {
+  echo "opencode-free: run \`opencode $1 ...\` directly; it manages the shared background service" >&2
+  exit 2
+}
+
+refuse_service() {
+  echo "opencode-free: can't run the shared background service; use opencode-free for the TUI or opencode-free acp for editors and bb" >&2
+  exit 2
+}
+
+# One scan of the arguments. `sub`: the first word that is a subcommand. `at`: the argument after
+# which --standalone goes: the subcommand, or for a command group its own subcommand (`session list`).
+sub=""
+at=0
+skip=0
+group=0
+i=0
+for a; do
+  i=$((i + 1))
+  if [ "$skip" = 1 ]; then
+    skip=0
+    continue
+  fi
+  case "$a" in
+    --) break ;;
+    --service) refuse_service ;;
+    --*=*) continue ;;
+    -*)
+      if takes_value "$a"; then skip=1; fi
+      continue
+      ;;
+  esac
+  if [ -n "$sub" ]; then
+    if [ "$a" = service ]; then
+      echo "opencode-free: quote the message: opencode-free $sub \"...\"" >&2
+      exit 2
+    fi
+    if [ "$group" = 1 ]; then
+      at=$i
+      group=0
+    fi
+    continue
+  fi
+  case "$a" in
+    acp | serve) sub=$a ;;
+    upgrade | update | uninstall | debug | pair | mcp | plugin) refuse_command "$a" ;;
+    api | models | stats | mini | run | reload) sub=$a at=$i ;;
+    session | auth) sub=$a group=1 ;;
+    service) refuse_service ;;
+  esac
+done
+
+# A bare --help or --version, and the commands that start their own server or take no --standalone.
+if [ "$#" = 1 ]; then
+  case "$1" in -h | --help | -v | --version) exec opencode "$@" ;; esac
+fi
+if [ -z "$sub" ]; then exec opencode --standalone "$@"; fi
+if [ "$at" = 0 ]; then exec opencode "$@"; fi
+
+# Insert --standalone after argument $at.
+n=$#
+i=0
+for a; do
+  i=$((i + 1))
+  set -- "$@" "$a"
+  if [ "$i" = "$at" ]; then set -- "$@" --standalone; fi
+done
+shift "$n"
 exec opencode "$@"

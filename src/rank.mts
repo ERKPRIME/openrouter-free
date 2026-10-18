@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Ranks the free models opencode can reach right now and writes ranking.json for plugin.ts.
+// Ranks the free models opencode can reach right now and writes ranking.json for plugin/index.ts.
 //   node rank.mts            refresh ranking.json
 //   node rank.mts --status   print ranking, cooldowns and per-session picks (no refresh)
 //   node rank.mts --quiet    refresh, printing only warnings (scheduled / plugin-triggered runs)
@@ -21,6 +21,8 @@ import {
   decodeModel,
   decodeState,
   asObject,
+  isArray,
+  isObject,
   list,
   entries,
   optString,
@@ -28,7 +30,7 @@ import {
   stringList,
   errorText,
 } from "./lib.mts"
-import type { ModelInfo, RankedRow, Row, Scored, SourceHit } from "./lib.mts"
+import type { JsonObject, ModelInfo, RankedRow, Row, Scored, SourceHit } from "./lib.mts"
 
 const arg = (name: string) => {
   const i = process.argv.indexOf(name)
@@ -140,23 +142,38 @@ async function openrouterStealth() {
   })
 }
 
-// `raw`: every model block opencode printed, kept whole for debugging eligibility.
+// Fields of a model entry that can hold credentials (provider settings carry the API key).
+const dropSecrets = ({ headers, body, settings, ...rest }: JsonObject) => rest
+
+// A model entry as kept in cache/candidates.json: without anything that can carry credentials.
+function stripSecrets(model: JsonObject) {
+  const m = dropSecrets(model)
+  return isArray(m.variants) ? { ...m, variants: m.variants.map((x) => dropSecrets(asObject(x))) } : m
+}
+
+// opencode prints the model list as one JSON object, possibly between log lines.
+function parseModelList(out: string) {
+  for (const text of [out, ...out.split("\n"), out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1)]) {
+    try {
+      const data = asObject(JSON.parse(text)).data
+      if (isArray(data)) return data
+    } catch {}
+  }
+  throw new Error("opencode model.list failed: no model list in its output")
+}
+
+// `raw`: every model entry opencode listed, credentials stripped, kept for debugging eligibility.
 function candidates(): { raw: unknown[]; models: ModelInfo[] } {
-  const r = spawnSync("opencode", ["models", "--verbose"], {
+  const r = spawnSync("opencode", ["api", "--standalone", "model.list"], {
     // FREE_ROUTER_RANKING stops the plugin (loaded by this opencode) from starting another ranking.
     env: { ...process.env, OPENCODE_CONFIG: CONFIG_FILE, FREE_ROUTER_DIR: DIR, FREE_ROUTER_RANKING: "1" },
     encoding: "utf8",
     timeout: 180_000,
     maxBuffer: 64 << 20,
   })
-  if (r.status !== 0) throw new Error(`opencode models failed: ${(r.stderr || r.error?.message || "").slice(0, 300)}`)
-  const raw: unknown[] = []
-  for (const [, , block = ""] of r.stdout.matchAll(/^(\S+\/\S+)\n(\{[\s\S]*?\n\})$/gm)) {
-    try {
-      raw.push(JSON.parse(block))
-    } catch {}
-  }
-  return { raw, models: list(raw, decodeModel) }
+  if (r.status !== 0) throw new Error(`opencode model.list failed: ${(r.stderr || r.error?.message || "").slice(0, 300)}`)
+  const data = parseModelList(r.stdout)
+  return { raw: list(data, (x) => (isObject(x) ? stripSecrets(x) : undefined)), models: list(data, decodeModel) }
 }
 
 async function refresh() {

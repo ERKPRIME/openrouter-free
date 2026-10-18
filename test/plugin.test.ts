@@ -1,29 +1,39 @@
-// plugin.ts runs inside opencode; these tests load it in-process against a fake opencode client
-// and an isolated FREE_ROUTER_DIR. setTimeout is mocked so retries and resumes run on demand.
-import { test, beforeEach, afterEach, after, mock } from "node:test"
+// plugin/index.ts runs inside opencode; these tests load it in-process against a fake plugin context
+// (hooks captured, switches and metadata updates recorded, events pushed by hand) and an isolated
+// FREE_ROUTER_DIR.
+import { test, beforeEach, after } from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import type { Event, SessionStatus, UserMessage } from "@opencode-ai/sdk"
-import type { ModelInfo, ModelRef } from "../src/lib.mts"
-import type { LiveProvider, RouterClient } from "../src/plugin.ts"
+import type { SessionPrompt, SessionRetry } from "@opencode/plugin/promise/session"
+import type { RouterContext, SessionLike } from "../src/plugin/index.ts"
 
 const DIR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "free-router-plugin-")))
 process.env.FREE_ROUTER_DIR = DIR
 for (const k of ["FREE_ROUTER_RANKING", "BB_THREAD_ID", "BB_CLI"]) delete process.env[k]
-// lib.mts reads FREE_ROUTER_DIR when it loads, so import it and plugin.ts only after setting it.
-const { decodeState, readJSON, split } = await import("../src/lib.mts")
-const { server } = await import("../src/plugin.ts")
+// lib.mts reads FREE_ROUTER_DIR when it loads, so import it and the plugin only after setting it.
+const { decodeState, readJSON } = await import("../src/lib.mts")
+const { default: plugin } = await import("../src/plugin/index.ts")
 
-type SessionError = NonNullable<Extract<Event, { type: "session.error" }>["properties"]["error"]>
-type PromptArgs = Parameters<RouterClient["session"]["promptAsync"]>[0]
+type Ref = { providerID: string; id: string }
+const ref = (id: string): Ref => ({ providerID: id.slice(0, id.indexOf("/")), id: id.slice(id.indexOf("/") + 1) })
+const FREE_AUTO = "free/auto"
 
-const VIRTUAL: ModelRef = { providerID: "free", modelID: "auto" }
-const model = split
-const live = (id: string, extra: Partial<ModelInfo> = {}): Omit<ModelInfo, "providerID"> => ({ id, name: id, status: "active", cost: { input: 0, output: 0 }, limit: { context: 200000 }, capabilities: { toolcall: true }, ...extra })
-const OPENCODE: LiveProvider = { id: "opencode", models: { "a-free": live("a-free"), "b-free": live("b-free"), "c-free": live("c-free") } }
-const PROVIDERS: LiveProvider[] = [OPENCODE, { id: "openai", models: { gpt: live("gpt", { cost: { input: 1, output: 1 } }) } }, { id: "empty" }]
+// A model.list entry as opencode 2 reports it.
+const listed = (id: string, extra: Record<string, unknown> = {}) => ({
+  ...ref(id),
+  name: id,
+  status: "active",
+  enabled: true,
+  cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
+  limit: { context: 200000, output: 4096 },
+  capabilities: { tools: true },
+  time: { released: 0 },
+  ...extra,
+})
+const PAID = [{ input: 1, output: 1, cache: { read: 0, write: 0 } }]
+const MODELS = [listed("opencode/a-free"), listed("opencode/b-free"), listed("opencode/c-free"), listed("openai/gpt", { cost: PAID })]
 
 const file = (name: string) => path.join(DIR, name)
 const writeJSON = (name: string, data: unknown) => fs.writeFileSync(file(name), JSON.stringify(data))
@@ -35,7 +45,7 @@ async function settle() {
   for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r))
 }
 
-// Real time passes for child processes; setTimeout is mocked, so poll on setImmediate.
+// Real time passes for child processes, so poll on setImmediate.
 async function until(cond: () => boolean, what: string) {
   const deadline = Date.now() + 10_000
   while (!cond()) {
@@ -44,290 +54,454 @@ async function until(cond: () => boolean, what: string) {
   }
 }
 
-interface FakeOptions {
-  providers?: LiveProvider[] | Error
-  statuses?: (Record<string, SessionStatus> | Error)[]
-  abort?: () => Promise<{ error?: unknown }>
-  prompt?: (a: PromptArgs) => Promise<{ error?: unknown }>
-}
-
-function fakeClient({ providers = PROVIDERS, statuses = [], abort, prompt }: FakeOptions = {}) {
-  const calls = { providers: 0, status: 0, abort: new Array<{ path: { id: string } }>(), prompt: new Array<PromptArgs>() }
-  const client: RouterClient = {
-    config: {
-      providers: async () => {
-        calls.providers++
-        if (providers instanceof Error) throw providers
-        return { data: { providers } }
-      },
+// An event stream the test feeds by hand; end() closes it like a dropped connection.
+function createFeed() {
+  const queue: unknown[] = []
+  let wake: (() => void) | undefined
+  let ended = false
+  let aborted = false
+  async function* subscribe({ signal }: { signal: AbortSignal }) {
+    signal.addEventListener("abort", () => {
+      aborted = true
+      wake?.()
+    })
+    for (;;) {
+      if (queue.length) yield queue.shift() as { type: string; data?: unknown }
+      else if (ended || aborted) return
+      else await new Promise<void>((r) => (wake = r))
+    }
+  }
+  return {
+    subscribe,
+    push: (ev: unknown) => {
+      queue.push(ev)
+      wake?.()
     },
-    session: {
-      abort: async (a) => {
-        calls.abort.push(a)
-        return abort ? abort() : {}
-      },
-      status: async () => {
-        const s = statuses[Math.min(calls.status++, statuses.length - 1)]
-        if (s instanceof Error) throw s
-        return { data: s }
-      },
-      promptAsync: (a) => {
-        calls.prompt.push(a)
-        return prompt ? prompt(a) : Promise.resolve({})
-      },
+    end: () => {
+      ended = true
+      wake?.()
+    },
+    get aborted() {
+      return aborted
     },
   }
-  return { client, calls }
 }
 
-// opencode sends the model with the variant picked for it, which the SDK's v1 message type leaves out.
-function userMessage(sessionID: string, agent: string, model: ModelRef): UserMessage {
-  const withVariant = { ...model, variant: "high" }
-  return { id: "msg_test", sessionID, role: "user", time: { created: 0 }, agent, model: withVariant }
+interface FakeOptions {
+  models?: unknown[] | Error
+  sessions?: Record<string, SessionLike>
+  defaultModel?: Ref | null
+  switchModel?: (input: { sessionID: string; model: Ref }) => Promise<void>
+  subscribe?: RouterContext["event"]["subscribe"]
+}
+
+function fakeContext({ models = MODELS, sessions = {}, defaultModel = ref(FREE_AUTO), switchModel, subscribe }: FakeOptions = {}) {
+  const state = new Map(Object.entries(sessions).map(([sid, s]) => [sid, structuredClone(s)]))
+  const calls = { list: 0, switches: new Array<{ sessionID: string; model: Ref }>(), updates: new Array<{ sessionID: string; metadata: unknown }>() }
+  const hooks: { prompt?: (e: SessionPrompt) => Promise<void> | void; retry?: (e: SessionRetry) => Promise<void> | void } = {}
+  const disposed = new Array<string>()
+  const feed = createFeed()
+  const ctx: RouterContext = {
+    model: {
+      list: async () => {
+        calls.list++
+        if (models instanceof Error) throw models
+        return { data: models }
+      },
+      default: async () => ({ data: defaultModel }),
+    },
+    session: {
+      get: async ({ sessionID }) => structuredClone(state.get(sessionID) ?? {}),
+      switchModel: async (input) => {
+        await switchModel?.(input)
+        calls.switches.push(input)
+        state.set(input.sessionID, { ...state.get(input.sessionID), model: input.model })
+      },
+      // Like opencode's, this replaces the whole metadata object.
+      update: async ({ sessionID, metadata }) => {
+        calls.updates.push({ sessionID, metadata })
+        state.set(sessionID, { ...state.get(sessionID), metadata })
+      },
+      hook: ((name: "prompt" | "retry", callback: never) => {
+        hooks[name] = callback
+        return Promise.resolve({ dispose: async () => void disposed.push(name) })
+      }) as RouterContext["session"]["hook"],
+    },
+    event: { subscribe: subscribe ?? feed.subscribe },
+  }
+  return { ctx, calls, hooks, state, disposed, feed }
 }
 
 async function start(opts: FakeOptions = {}) {
-  const { client, calls } = fakeClient(opts)
-  const hooks = await server({ client })
-  const chat = hooks["chat.message"]
-  const event = hooks.event
-  assert.ok(chat && event)
-  const send = async (sid: string, model: ModelRef, { agent = "build" } = {}) => {
-    const output = { message: userMessage(sid, agent, model), parts: [] }
-    await chat({ sessionID: sid, model, agent }, output)
-    return output.message.model
+  const fake = fakeContext(opts)
+  const cleanup = await plugin.setup(fake.ctx)
+  const { hooks } = fake
+  assert.ok(hooks.prompt && hooks.retry && typeof cleanup === "function")
+  const prompt = (sid: string) => hooks.prompt?.({ sessionID: sid, messageID: "msg", prompt: { text: "hi" }, delivery: "steer" } as unknown as SessionPrompt)
+  // The hook sees opencode's own decision (a 429 waits 15 minutes) and may replace it.
+  const retry = async (sid: string, f: { model?: string; type?: string; message?: string; status?: number; body?: string; attempt?: number; delay?: number | undefined; retry?: boolean } = {}) => {
+    const e = {
+      sessionID: sid,
+      agent: "build",
+      model: ref(f.model ?? "opencode/a-free"),
+      error: { type: f.type ?? "provider.rate-limit", message: f.message ?? "Rate limit exceeded", status: f.status ?? 429, ...(f.body ? { response: { body: f.body } } : {}) },
+      attempt: f.attempt ?? 2,
+      decision: f.retry === false ? { retry: false } : { retry: true, delay: f.delay ?? 900_000 },
+    }
+    await hooks.retry?.(e as unknown as SessionRetry)
+    return e.decision
   }
-  const emit = (e: Event) => event({ event: e })
-  const retry = (sid: string, message: string, attempt = 1) => emit({ type: "session.status", properties: { sessionID: sid, status: { type: "retry", attempt, message, next: 0 } } })
-  const fail = (sid: string, error: SessionError) => emit({ type: "session.error", properties: { sessionID: sid, error } })
-  const idle = (sid: string) => emit({ type: "session.status", properties: { sessionID: sid, status: { type: "idle" } } })
-  const promptText = (i = 0) => calls.prompt[i]?.body.parts[0]?.text ?? ""
-  return { calls, send, emit, retry, fail, idle, promptText }
+  const emit = async (type: string, sid: string) => {
+    fake.feed.push({ type, data: { sessionID: sid } })
+    await settle()
+  }
+  return { ...fake, cleanup, prompt, retry, emit }
 }
 
-const apiError = (message: string, statusCode: number): SessionError => ({ name: "APIError", data: { message, statusCode, isRetryable: false } })
+const pickOf = (p: Awaited<ReturnType<typeof start>>, sid: string) => p.state.get(sid)?.model
+const IMMEDIATELY = { retry: true, delay: 0 }
+const quota = { type: "provider.quota", message: "Free usage exceeded, subscribe to Go", status: 429 }
 
 beforeEach(() => {
   for (const f of fs.readdirSync(DIR)) fs.rmSync(file(f), { recursive: true, force: true })
   writeJSON("ranking.json", { models: [{ id: "opencode/a-free" }, { id: "opencode/b-free" }, { id: "opencode/c-free" }] })
-  mock.timers.enable({ apis: ["setTimeout"] })
 })
 
-afterEach(() => mock.timers.reset())
 after(() => fs.rmSync(DIR, { recursive: true, force: true }))
 
-test("free/auto gets the best free model, which then sticks to the session", async () => {
-  const p = await start()
-  assert.deepEqual(await p.send("s1", VIRTUAL), model("opencode/a-free"), "variant of the placeholder is dropped")
+test("free/auto gets the best free model, which then sticks to the session and is kept in its metadata", async () => {
+  const p = await start({ sessions: { s1: {}, s2: {}, s4: { model: ref("openai/gpt") } } })
+  await p.prompt("s1")
+  assert.deepEqual(p.calls.switches, [{ sessionID: "s1", model: ref("opencode/a-free") }], "no variant: the placeholder's means nothing to a real model")
   assert.equal(readState().sessions.s1?.model, "opencode/a-free")
+  assert.deepEqual(p.state.get("s1")?.metadata, { freeRouter: { pick: "opencode/a-free" } })
   assert.match(logText(), /pick s1 -> opencode\/a-free\n/)
 
-  // A newer ranking does not move a session that already has a healthy model.
+  // A newer ranking does not move a session that already has a healthy model, and does not touch it again.
   writeJSON("ranking.json", { models: [{ id: "opencode/b-free" }, { id: "opencode/a-free" }] })
   fs.utimesSync(file("ranking.json"), new Date(), new Date(Date.now() + 5000))
-  assert.deepEqual(await p.send("s1", model("opencode/a-free")), model("opencode/a-free"))
+  await p.prompt("s1")
+  assert.equal(p.calls.switches.length, 1)
+  assert.equal(p.calls.updates.length, 1)
   assert.equal(count(logText(), "pick "), 1)
-  assert.deepEqual(await p.send("s2", VIRTUAL), model("opencode/b-free"), "new sessions follow the new ranking")
-
-  assert.equal(p.calls.providers, 1, "live model list is cached")
+  await p.prompt("s2")
+  assert.equal(pickOf(p, "s2")?.id, "b-free", "new sessions follow the new ranking")
+  assert.equal(p.calls.list, 1, "the model list is cached")
 
   // Anything else is left alone, including its errors.
-  assert.deepEqual(await p.send("s4", model("openai/gpt")), { ...model("openai/gpt"), variant: "high" })
-  await p.fail("s4", apiError("Unauthorized", 401))
-  await p.emit({ type: "server.connected", properties: {} })
-  await p.emit({ type: "session.error", properties: { error: apiError("Unauthorized", 401) } })
-  const state = readState()
-  assert.equal(state.sessions.s4, undefined)
-  assert.deepEqual(state.cooldowns, {})
+  await p.prompt("s4")
+  assert.equal(p.calls.switches.length, 2)
+  assert.deepEqual(await p.retry("s4", { model: "openai/gpt", status: 401, type: "provider.auth", message: "Unauthorized", retry: false }), { retry: false })
+  assert.equal(readState().sessions.s4, undefined)
+  assert.deepEqual(readState().cooldowns, {})
 })
 
-test("no free model leaves free/auto in place", async () => {
-  const none = await start({ providers: [] })
-  assert.deepEqual(await none.send("s1", VIRTUAL), { ...VIRTUAL, variant: "high" })
-  await none.send("s1", VIRTUAL)
-  assert.equal(none.calls.providers, 2, "an empty live list is not cached")
-  // Managed but never assigned a model: a failure has nothing to fail over from.
-  await none.retry("s1", "Free usage exceeded")
+test("existing metadata is kept when the pick is recorded", async () => {
+  const p = await start({ sessions: { s1: { metadata: { mine: { n: 1 } } } } })
+  await p.prompt("s1")
+  assert.deepEqual(p.state.get("s1")?.metadata, { mine: { n: 1 }, freeRouter: { pick: "opencode/a-free" } })
+})
+
+test("a session is routed while on its pick, even after the sticky record expired, until the user picks another model", async () => {
+  // The sticky record is gone, but the metadata remembers the pick: still ours, so it is picked again.
+  const p = await start({ sessions: { s1: { model: ref("opencode/b-free"), metadata: { freeRouter: { pick: "opencode/b-free" } } } } })
+  await p.prompt("s1")
+  assert.equal(pickOf(p, "s1")?.id, "a-free")
+  assert.equal(p.calls.switches.length, 1)
+
+  // /model to another model: it is neither free/auto nor the pick, so routing ends there.
+  const q = await start({ sessions: { s2: { model: ref("opencode/c-free"), metadata: { freeRouter: { pick: "opencode/b-free" } } } } })
+  await q.prompt("s2")
+  assert.equal(q.calls.switches.length, 0)
+  assert.deepEqual(await q.retry("s2", { model: "opencode/c-free" }), { retry: true, delay: 900_000 }, "its failures are opencode's business")
+  assert.equal(readState().sessions.s2, undefined)
+  assert.deepEqual(readState().cooldowns, {})
+
+  // /model free/auto rejoins.
+  q.state.set("s2", { ...q.state.get("s2"), model: ref(FREE_AUTO) })
+  await q.prompt("s2")
+  assert.equal(pickOf(q, "s2")?.id, "a-free")
+})
+
+test("children and forks follow the pick of the session they came from", async () => {
+  writeJSON("state.json", { cooldowns: {}, sessions: { parent: { model: "opencode/b-free", at: Date.now() } } })
+  const p = await start({
+    sessions: {
+      parent: { model: ref("opencode/b-free") },
+      child: { parentID: "parent", model: ref("opencode/b-free") },
+      other: { parentID: "parent", model: ref("opencode/c-free") },
+      fork: { fork: { sessionID: "parent" }, model: ref("opencode/b-free") },
+      free: { parentID: "parent", model: ref(FREE_AUTO) },
+    },
+  })
+  await p.prompt("child")
+  assert.equal(pickOf(p, "child")?.id, "a-free", "managed: it runs on its parent's pick, so it gets a pick of its own")
+  await p.prompt("fork")
+  assert.equal(pickOf(p, "fork")?.id, "a-free")
+  await p.prompt("other")
+  assert.equal(pickOf(p, "other")?.id, "c-free", "a model of its own choosing stays")
+  await p.prompt("free")
+  assert.equal(pickOf(p, "free")?.id, "a-free", "free/auto is always ours")
+
+  // A child that never saw the prompt hook (its first action was a command) still fails over.
+  const q = await start({ sessions: { parent: { model: ref("opencode/a-free") }, kid: { parentID: "parent", model: ref("opencode/a-free") } } })
+  writeJSON("state.json", { cooldowns: {}, sessions: { parent: { model: "opencode/a-free", at: Date.now() } } })
+  assert.deepEqual(await q.retry("kid"), IMMEDIATELY)
+  assert.equal(pickOf(q, "kid")?.id, "b-free")
+  assert.equal(readState().cooldowns["opencode/a-free"]?.klass, "rate")
+})
+
+test("a message that arrives while a turn runs changes nothing", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  await p.emit("session.execution.started", "s1")
+  await p.prompt("s1")
+  assert.equal(p.calls.switches.length, 0, "a steer or queued message: the session is on its pick already")
+  await p.emit("session.execution.succeeded", "s1")
+  await p.prompt("s1")
+  assert.equal(p.calls.switches.length, 1)
+
+  for (const end of ["session.execution.failed", "session.execution.interrupted", "session.idle"]) {
+    await p.emit("session.execution.started", "s1")
+    await p.emit(end, "s1")
+    p.state.set("s1", { model: ref(FREE_AUTO) })
+    await p.prompt("s1")
+    assert.equal(pickOf(p, "s1")?.id, "a-free", end)
+  }
+  await p.emit("server.connected", "s1")
+  await p.emit("session.text.started", "nobody")
+})
+
+test("no free model leaves free/auto in place and fails fast", async () => {
+  const none = await start({ models: [], sessions: { s1: {} } })
+  await none.prompt("s1")
+  await none.prompt("s1")
+  assert.equal(none.calls.list, 2, "an empty model list is not cached")
+  assert.equal(none.calls.switches.length, 0)
+  assert.deepEqual(await none.retry("s1", { model: FREE_AUTO, type: "provider.transport", status: undefined as never }), { retry: false })
   assert.equal(fs.existsSync(file("state.json")), false)
 
-  const broken = await start({ providers: new Error("server down") })
-  await broken.send("s1", VIRTUAL)
+  const broken = await start({ models: new Error("server down"), sessions: { s1: {} } })
+  await broken.prompt("s1")
   const log = logText()
-  assert.match(log, /choose failed s1: server down\n/)
+  assert.match(log, /prompt hook failed s1: Error: server down/)
   assert.equal(count(log, "ERROR no free model available for s1; free/auto left in place"), 3)
 })
 
-test("a retry that exhausts the model fails over, aborts the turn and continues on the next model", async () => {
-  const p = await start({ statuses: [{ s1: { type: "busy" } }, { s1: { type: "idle" } }] })
-  await p.send("s1", VIRTUAL)
+test("free/auto reaching the retry hook (a command the prompt hook never routed) is picked there", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  const decision = await p.retry("s1", { model: FREE_AUTO, type: "provider.transport", message: "ConnectionRefused", status: undefined as never })
+  assert.deepEqual(decision, IMMEDIATELY)
+  assert.deepEqual(p.calls.switches, [{ sessionID: "s1", model: ref("opencode/a-free") }])
+  assert.equal(readState().sessions.s1?.model, "opencode/a-free")
+  assert.deepEqual(readState().cooldowns, {}, "the placeholder is not a failed model")
+})
 
-  await p.retry("s1", "Provider is overloaded")
-  assert.match(logText(), /retry s1 attempt 1: Provider is overloaded \(letting opencode retry\)\n/)
-  assert.equal(p.calls.abort.length, 0)
+test("a failure that exhausts the model switches in place and retries at once", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
 
-  await p.retry("s1", "Free usage exceeded, subscribe to Go")
+  // A short rate limit: opencode's own retry is left alone.
+  const wait = await p.retry("s1", { delay: 3000 })
+  assert.deepEqual(wait, { retry: true, delay: 3000 })
+  assert.match(logText(), /retry s1 attempt 2: Rate limit exceeded \(letting opencode retry\)\n/)
+
+  const decision = await p.retry("s1", { ...quota, body: '{"error":{"message":"secret-body"}}' })
+  assert.deepEqual(decision, IMMEDIATELY)
   const state = readState()
   assert.equal(state.cooldowns["opencode/a-free"]?.klass, "quota")
   assert.equal(state.cooldowns["opencode/a-free"]?.reason, "Free usage exceeded, subscribe to Go")
   assert.equal(state.sessions.s1?.model, "opencode/b-free")
-  assert.deepEqual(p.calls.abort, [{ path: { id: "s1" } }])
+  assert.deepEqual(p.calls.switches.at(-1), { sessionID: "s1", model: ref("opencode/b-free") })
+  assert.deepEqual(p.state.get("s1")?.metadata, { freeRouter: { pick: "opencode/b-free" } })
   assert.match(logText(), /failover s1: opencode\/a-free -> opencode\/b-free \(quota: Free usage exceeded, subscribe to Go\)\n/)
-
-  await p.retry("s1", "Free usage exceeded", 2)
-  assert.equal(p.calls.abort.length, 1, "no second failover while one is pending")
-
-  // opencode is still winding the aborted turn down: wait for idle, once.
-  await Promise.all([p.idle("s1"), p.idle("s1")])
-  assert.equal(p.calls.status, 1)
-  assert.equal(p.calls.prompt.length, 0)
-  mock.timers.tick(700)
-  await settle()
-  assert.deepEqual(p.calls.prompt, [
-    {
-      path: { id: "s1" },
-      body: {
-        model: model("opencode/b-free"),
-        agent: "build",
-        parts: [{ type: "text", text: "[free-router] opencode/a-free hit its usage limit; switched to opencode/b-free. Continue the task from where it stopped." }],
-      },
-    },
-  ])
-  assert.match(logText(), /continued s1 on opencode\/b-free\n/)
-
-  // The fallback resume finds nothing left to do.
-  mock.timers.tick(1500)
-  await settle()
-  assert.equal(p.calls.prompt.length, 1)
+  assert.ok(!logText().includes("secret-body") && !fs.readFileSync(file("state.json"), "utf8").includes("secret-body"), "the response body is only read, never kept")
 })
 
-test("an idle that fired before the failover is covered by the fallback resume", async () => {
-  const p = await start()
-  await p.send("s1", VIRTUAL, { agent: "" })
-  await p.retry("s1", "Free usage exceeded")
-  assert.equal(p.calls.prompt.length, 0)
-  mock.timers.tick(1500)
-  await settle()
-  assert.equal(p.calls.prompt.length, 1)
-  assert.equal(p.calls.prompt[0]?.body.agent, undefined)
+test("long messages are cut before they are kept", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  await p.retry("s1", { ...quota, message: `Free usage exceeded ${"x".repeat(500)}` })
+  assert.equal(readState().cooldowns["opencode/a-free"]?.reason?.length, 200)
+  assert.ok(logText().split("\n").every((l) => l.length < 260))
 })
 
-test("session errors fail over without aborting; auth failures cool the whole provider", async () => {
-  const p = await start()
-  await p.send("s1", VIRTUAL)
-  await p.fail("s1", { name: "MessageAbortedError", data: { message: "aborted" } })
-  assert.equal(fs.existsSync(file("state.json")) && Object.keys(readState().cooldowns).length, 0)
-
-  await p.fail("s1", apiError("Unauthorized", 401))
+test("auth failures cool the whole provider", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  assert.deepEqual(await p.retry("s1", { type: "provider.auth", message: "Unauthorized", status: 401, retry: false }), IMMEDIATELY)
   const state = readState()
   assert.equal(state.cooldowns["opencode/*"]?.klass, "auth")
-  assert.equal(state.cooldowns["opencode/*"]?.reason, "APIError: Unauthorized")
+  assert.equal(state.cooldowns["opencode/*"]?.reason, "Unauthorized")
   assert.equal(state.sessions.s1?.model, "opencode/b-free", "every model is cooling, so the one that frees up first")
   assert.match(logText(), /WARN all free models are cooling down; using the one that frees up first: opencode\/b-free\n/)
-  assert.equal(p.calls.abort.length, 0, "the turn already ended")
-
-  await p.emit({ type: "session.idle", properties: { sessionID: "s1" } })
-  assert.equal(p.calls.prompt.length, 1)
-  assert.match(p.promptText(), /hit its auth failure;/)
 })
 
-test("failovers stop at maxSwitchesPerTurn and when nothing else is left", async () => {
-  writeJSON("config.json", { maxSwitchesPerTurn: 1 })
-  const p = await start()
-  const gone = apiError("model not found", 404)
-  await p.send("s1", VIRTUAL)
-  await p.fail("s1", gone)
-  await p.idle("s1")
-  assert.equal(p.calls.prompt.length, 1)
-  assert.match(p.promptText(), /hit its availability check \(removed or refused\);/)
-  assert.equal(readState().cooldowns["opencode/a-free"]?.reason, "APIError: model not found")
+test("failures are counted from the last switch", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
+  // opencode's first failure is attempt 2; one 429 there is a transient one.
+  assert.deepEqual(await p.retry("s1", { attempt: 2, delay: 3000 }), { retry: true, delay: 3000 })
+  assert.equal(p.calls.switches.length, 1)
+  assert.equal((await p.retry("s1", { attempt: 3, delay: 3000 })).delay, 0, "the second one in a row is not")
+  assert.equal(pickOf(p, "s1")?.id, "b-free")
 
-  // The continue belongs to the same turn, so it keeps the spent budget.
-  await p.send("s1", model("opencode/b-free"))
-  await p.fail("s1", gone)
+  // The counter does not restart on the new model: attempt 4 is its first failure, and a transient one.
+  assert.deepEqual(await p.retry("s1", { model: "opencode/b-free", attempt: 4, delay: 3000 }), { retry: true, delay: 3000 })
+  assert.equal(pickOf(p, "s1")?.id, "b-free")
+  // A counter behind the switch (clamped to 1) does not fail over either.
+  assert.deepEqual(await p.retry("s1", { model: "opencode/b-free", attempt: 1, delay: 3000 }), { retry: true, delay: 3000 })
+  assert.deepEqual(await p.retry("s1", { model: "opencode/b-free", attempt: 5, delay: 3000 }), IMMEDIATELY)
+  assert.equal(pickOf(p, "s1")?.id, "c-free")
+})
+
+test("two failures of the same model switch once, the late one is told not to retry on the old model", async () => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>((r) => (release = r))
+  const p = await start({ sessions: { s1: {} }, switchModel: async ({ model }) => (model.id === "b-free" ? gate : undefined) })
+  await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
+  const first = p.retry("s1", quota)
+  const second = p.retry("s1", { ...quota, message: "Free usage exceeded again" })
+  await settle()
+  release()
+  assert.deepEqual(await first, IMMEDIATELY)
+  assert.deepEqual(await second, { retry: false }, "its request keeps the old model, which only fails again")
+  assert.equal(count(logText(), "failover "), 1)
+  assert.equal(p.calls.switches.filter((s) => s.model.id === "b-free").length, 1)
+  assert.equal(readState().cooldowns["opencode/a-free"]?.reason, "Free usage exceeded, subscribe to Go", "the late one adds no cooldown")
+})
+
+test("failovers stop at maxSwitchesPerTurn and when nothing else is left; a new execution gets a new budget", async () => {
+  writeJSON("config.json", { maxSwitchesPerTurn: 1 })
+  const gone = { type: "provider.invalid-request", message: "model not found", status: 404, retry: false }
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
+  assert.deepEqual(await p.retry("s1", gone), IMMEDIATELY)
+  assert.equal(readState().cooldowns["opencode/a-free"]?.reason, "model not found")
+
+  // Spent: the error surfaces now instead of sleeping, and the model is still cooled.
+  assert.deepEqual(await p.retry("s1", { ...gone, model: "opencode/b-free", attempt: 3 }), { retry: false })
   assert.match(logText(), /give up s1: already switched 1 times this turn; leaving opencode\/b-free \(unavailable\)\n/)
+  assert.ok(readState().cooldowns["opencode/b-free"])
   assert.equal(readState().sessions.s1?.model, "opencode/b-free")
 
-  // A new user message gets a new budget.
-  assert.deepEqual(await p.send("s1", model("opencode/b-free")), model("opencode/c-free"), "b-free is cooling now")
-  await p.fail("s1", gone)
-  assert.match(logText(), /failover s1: opencode\/c-free -> opencode\/a-free \(unavailable/)
+  // A queued message starts a new execution, and with it a new budget.
+  await p.emit("session.execution.succeeded", "s1")
+  await p.emit("session.execution.started", "s1")
+  assert.deepEqual(await p.retry("s1", { ...gone, model: "opencode/b-free", attempt: 2 }), IMMEDIATELY)
+  assert.equal(readState().sessions.s1?.model, "opencode/c-free")
 
-  const lone = await start({ providers: [{ id: "opencode", models: { "a-free": live("a-free") } }] })
-  await lone.send("s2", VIRTUAL)
-  await lone.fail("s2", gone)
+  const lone = await start({ models: [listed("opencode/a-free")], sessions: { s2: {} } })
+  await lone.prompt("s2")
+  assert.deepEqual(await lone.retry("s2", gone), { retry: false })
   assert.match(logText(), /no alternative for s2; staying on opencode\/a-free \(unavailable\)\n/)
+})
+
+test("when the event stream ends the next prompt starts a fresh turn", async () => {
+  writeJSON("config.json", { maxSwitchesPerTurn: 1 })
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
+  assert.deepEqual(await p.retry("s1", quota), IMMEDIATELY)
+  assert.deepEqual(await p.retry("s1", { ...quota, model: "opencode/b-free", attempt: 3 }), { retry: false }, "budget spent")
+
+  // The stream dies while the session looks busy; its next message must still be routed and failed over.
+  p.feed.end()
+  await settle()
+  await p.prompt("s1")
+  assert.equal(pickOf(p, "s1")?.id, "c-free", "b-free is cooling, so the new turn starts on the next one")
+  assert.deepEqual(await p.retry("s1", { ...quota, model: "opencode/c-free", attempt: 2 }), IMMEDIATELY)
+  assert.equal(count(logText(), "failover "), 2, "the earlier switch did not use up the new turn's budget")
+})
+
+test("a command-first session (no prompt hook) with only its metadata pick still fails over", async () => {
+  const p = await start({ sessions: { s1: { model: ref("opencode/a-free"), metadata: { freeRouter: { pick: "opencode/a-free" } } } } })
+  assert.equal(readState().sessions.s1, undefined, "the sticky record is gone")
+  assert.deepEqual(await p.retry("s1"), IMMEDIATELY)
+  assert.equal(pickOf(p, "s1")?.id, "b-free")
 })
 
 test("autoContinue off switches the model but leaves the next message to the user", async () => {
   writeJSON("config.json", { autoContinue: false })
-  const p = await start()
-  await p.send("s1", VIRTUAL)
-  await p.retry("s1", "Too Many Requests", 2)
-  await p.idle("s1")
-  assert.equal(p.calls.prompt.length, 0)
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  assert.deepEqual(await p.retry("s1"), { retry: false })
   assert.match(logText(), /switched s1 to opencode\/b-free; autoContinue off, next message will use it\n/)
   assert.equal(readState().sessions.s1?.model, "opencode/b-free")
 })
 
-test("abort, status and continue failures are logged, never thrown", async () => {
-  const p = await start({
-    statuses: [new Error("status down")],
-    abort: () => Promise.reject(new Error("abort down")),
-    prompt: () => Promise.resolve({ error: { name: "BadRequest" } }),
-  })
-  await p.send("s1", VIRTUAL)
-  await p.retry("s1", "Free usage exceeded")
-  await p.idle("s1")
-  const log = logText()
-  assert.match(log, /abort failed s1: \{\}\n/)
-  assert.match(log, /continue failed s1: \{"name":"BadRequest"\}\n/)
-
-  const q = await start({ prompt: () => Promise.reject(new Error("prompt down")) })
-  await q.send("s2", VIRTUAL)
-  await q.retry("s2", "Free usage exceeded")
-  await q.idle("s2")
-  assert.match(logText(), /continue failed s2: \{\}\n/)
-
-  const r = await start({
-    prompt: () => {
-      throw new Error("sdk bug")
-    },
-  })
-  await r.send("s3", VIRTUAL)
-  await r.retry("s3", "Free usage exceeded")
-  await r.idle("s3")
-  assert.match(logText(), /event session\.status failed s3: Error: sdk bug\n/)
+test("what is not the model's fault is left to opencode", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  const overflow = { type: "provider.invalid-request", message: "context_length_exceeded", status: 400 }
+  assert.deepEqual(await p.retry("s1", overflow), { retry: true, delay: 900_000 })
+  assert.deepEqual(await p.retry("s1", { ...overflow, retry: false }), { retry: false })
+  assert.deepEqual(readState().cooldowns, {})
+  assert.equal(p.calls.switches.length, 1)
 })
 
-test("under bb's ACP agent the continue is queued as a thread message", async (t) => {
-  const bin = file("bin")
-  fs.mkdirSync(bin)
-  fs.writeFileSync(path.join(bin, "bb"), '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$FREE_ROUTER_DIR/bb-args"\n', { mode: 0o755 })
-  fs.writeFileSync(path.join(bin, "bb-broken"), "#!/bin/sh\necho 'no such thread' >&2\nexit 1\n", { mode: 0o755 })
-  process.env.BB_THREAD_ID = "thr_test"
-  process.env.BB_CLI = path.join(bin, "bb")
-  process.argv.push("acp")
-  t.after(() => {
-    delete process.env.BB_THREAD_ID
-    delete process.env.BB_CLI
-    process.argv.pop()
+test("model list, switch and metadata failures are logged, never thrown", async () => {
+  const p = await start({
+    sessions: { s1: {}, s2: {} },
+    switchModel: async ({ sessionID }) => {
+      if (sessionID === "s2") throw new Error("switch down")
+    },
   })
+  await p.prompt("s2")
+  assert.match(logText(), /prompt hook failed s2: Error: switch down/)
+  await p.prompt("s1")
+  assert.equal(await p.retry("s2", { model: FREE_AUTO }).then(() => "returned"), "returned")
+  assert.match(logText(), /retry hook failed s2: Error: switch down/)
 
+  const q = await start({ models: new Error("list down"), sessions: { s3: { model: ref("opencode/a-free"), metadata: { freeRouter: { pick: "opencode/a-free" } } } } })
+  assert.equal(await q.retry("s3").then(() => "returned"), "returned")
+  assert.match(logText(), /retry hook failed s3: Error: list down/)
+})
+
+test("a throwing event handler is logged by type and message only", async () => {
+  const p = await start({ sessions: {} })
+  const secret = "PROMPT-TEXT-THE-USER-TYPED"
+  p.feed.push({
+    type: "session.execution.started",
+    get data(): never {
+      throw new Error(`boom ${"x".repeat(400)}`)
+    },
+    payload: secret,
+  })
+  await settle()
+  const log = logText()
+  assert.match(log, /event session\.execution\.started failed: boom x+\n/)
+  assert.ok(!log.includes(secret))
+  assert.ok(log.split("\n").every((l) => l.length < 300))
+  // The loop survives it.
+  await p.emit("session.execution.started", "s1")
+  await p.prompt("s1")
+  assert.equal(p.calls.switches.length, 0)
+})
+
+test("a failing event stream is logged and leaves every session not busy", async () => {
+  const p = await start({
+    sessions: { s1: {} },
+    subscribe: async function* () {
+      yield { type: "session.execution.started", data: { sessionID: "s1" } }
+      throw new Error(`stream down ${"x".repeat(400)}`)
+    },
+  })
+  await settle()
+  assert.match(logText(), /event stream failed: stream down x+\n/)
+  assert.ok(logText().split("\n").every((l) => l.length < 300))
+  await p.prompt("s1")
+  assert.equal(p.calls.switches.length, 1, "routed although the stream said the turn was running")
+})
+
+test("cleanup stops the event stream and disposes both hooks", async () => {
   const p = await start()
-  await p.send("s1", VIRTUAL)
-  await p.retry("s1", "Free usage exceeded")
-  await p.idle("s1")
-  await until(() => logText().includes("queued bb continue"), "bb continue")
-  assert.match(logText(), /queued bb continue for thr_test on opencode\/b-free\n/)
-  assert.deepEqual(fs.readFileSync(file("bb-args"), "utf8").split("\n").slice(0, 5), ["thread", "message", "--mode", "queue", "thr_test"])
-  assert.equal(p.calls.prompt.length, 0, "never prompts behind bb's back")
-
-  process.env.BB_CLI = path.join(bin, "bb-broken")
-  await p.send("s2", VIRTUAL)
-  await p.retry("s2", "Free usage exceeded")
-  await p.idle("s2")
-  await until(() => logText().includes("bb continue failed"), "bb failure")
-  assert.match(logText(), /bb continue failed s2: no such thread\n/)
+  await p.cleanup?.()
+  assert.deepEqual(p.disposed.sort(), ["prompt", "retry"])
+  assert.equal(p.feed.aborted, true)
 })
 
 test("a stale ranking is refreshed in the background, one run at a time", async (t) => {
@@ -391,12 +565,12 @@ test("a stale ranking is refreshed in the background, one run at a time", async 
 
 test("the log rotates past 1 MiB and a broken log never breaks the plugin", async () => {
   fs.writeFileSync(file("router.log"), "x".repeat((1 << 20) + 1))
-  const p = await start({ providers: [] })
-  await p.send("s1", VIRTUAL)
+  const p = await start({ models: [], sessions: { s1: {} } })
+  await p.prompt("s1")
   assert.equal(fs.statSync(file("router.log.1")).size, (1 << 20) + 1)
   assert.match(logText(), /^\S+ ERROR no free model available for s1/)
 
   fs.rmSync(file("router.log"))
   fs.mkdirSync(file("router.log"))
-  await p.send("s1", VIRTUAL)
+  await p.prompt("s1")
 })

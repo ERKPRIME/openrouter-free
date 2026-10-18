@@ -1,5 +1,5 @@
 {
-  // Type-check only. The .ts/.mts sources ship as they are: opencode (Bun) loads plugin.ts, and
+  // Type-check only. The .ts/.mts sources ship as they are: opencode (Bun) loads plugin/index.ts, and
   // node 22.18+ or bun runs rank.mts, both stripping the types at load time. That is why only
   // erasable syntax is allowed and imports name the .ts/.mts file itself.
   "compilerOptions": {
