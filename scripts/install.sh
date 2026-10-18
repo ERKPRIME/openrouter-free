@@ -89,7 +89,7 @@ if active | grep -Eq "$old_entry"; then
   echo "updated  $dir/free.jsonc (plugin -> plugins)"
 fi
 if active | grep -Eq '"plugin"[[:space:]]*:' || ! active | grep -Eq '"plugins"[[:space:]]*:[^]]*"\./plugin"'; then
-  echo "installed the code, but $dir/free.jsonc does not load it: replace its \"plugin\" entry with \"plugins\": [\"./plugin\"] (on one line), then run install.sh again" >&2
+  echo "installed the code, but $dir/free.jsonc does not load it: replace its \"plugin\" entry with \"plugins\": [\"./plugin\"] (on one line, and move any other entries of the old array into it), then run install.sh again" >&2
   exit 1
 fi
 copy_once "$repo/templates/config.example.json" "$dir/config.json"

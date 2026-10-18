@@ -92,7 +92,7 @@ test("a free.jsonc that does not load the plugin directory fails the install wit
     if (ok) assert.equal(r.status, 0, `${what}: ${r.stderr}`)
     else {
       assert.equal(r.status, 1, what)
-      assert.match(r.stderr, /does not load it: replace its "plugin" entry with "plugins": \["\.\/plugin"\] \(on one line\), then run install\.sh again/, what)
+      assert.match(r.stderr, /does not load it: replace its "plugin" entry with "plugins": \["\.\/plugin"\] \(on one line, and move any other entries of the old array into it\), then run install\.sh again/, what)
     }
     assert.equal(read(dir, "free.jsonc"), config, `${what}: left as it was`)
   }

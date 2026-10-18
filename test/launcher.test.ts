@@ -51,8 +51,9 @@ const RUNS: [args: string[], argv: string[]][] = [
   [["stats", "--days", "3"], ["stats", "--standalone", "--days", "3"]],
   [["session", "list"], ["session", "list", "--standalone"]],
   [["auth", "list"], ["auth", "list", "--standalone"]],
-  // A group without its command has nothing to run.
-  [["session"], ["session"]],
+  // A group without its command still runs standalone, and the command takes the flag when it follows.
+  [["session"], ["session", "--standalone"]],
+  [["auth"], ["auth", "--standalone"]],
   // These start their own server, which reads OPENCODE_CONFIG itself.
   [["acp"], ["acp"]],
   [["serve", "--port", "1"], ["serve", "--port", "1"]],
@@ -94,8 +95,8 @@ test("commands that manage the shared background service are refused, with the p
 
 test("the shared background service is refused, with a hint when the word is part of a message", (t) => {
   const dir = setup(t)
-  const refused = /^opencode-free: can't run the shared background service; use opencode-free for the TUI or opencode-free acp for editors and bb\n$/
-  for (const args of [["service"], ["service", "restart"], ["serve", "--service"], ["--agent", "run", "service"], ["--log-level", "debug", "service", "stop"]]) {
+  const refused = /^opencode-free: can't run the shared background service, and refuses --service anywhere in the arguments \(quote it inside a message\); use opencode-free for the TUI or opencode-free acp for editors and bb\n$/
+  for (const args of [["service"], ["service", "restart"], ["serve", "--service"], ["serve", "--service=true"], ["--service=1"], ["--agent", "--service"], ["--log-level", "--service"], ["--agent", "run", "service"], ["--log-level", "debug", "service", "stop"]]) {
     const r = launch(dir, args)
     assert.equal(r.status, 2, args.join(" "))
     assert.match(r.stderr, refused, args.join(" "))

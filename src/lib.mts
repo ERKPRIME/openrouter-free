@@ -62,15 +62,21 @@ export function entries<T>(v: unknown, decode: (x: unknown) => T | undefined): R
   return out
 }
 
-// A model has one price per context tier. It counts as free only when every tier is zero: the
-// highest-priced tier is reported, so a paid long-context tier is never mistaken for free. No tiers,
-// or one that does not decode, leaves the cost unknown (not free).
+// A model has one price per context tier. It counts as free only when every tier is zero, cache
+// prices included: the highest-priced tier is reported, so a paid long-context tier is never mistaken
+// for free. No tiers, or one that does not decode, leaves the cost unknown (not free). `cost` is only
+// read by the free check, so the cache prices are folded into `input` rather than carried on.
 function decodeCost(v: unknown) {
   const tiers = asArray(v).map((x) => {
     const c = asObject(x)
+    // An absent cache is 0 prices; one that is present but no object makes the tier unknown.
+    const cache = c.cache === undefined ? {} : isObject(c.cache) ? c.cache : undefined
     const input = optNumber(c.input)
     const output = optNumber(c.output)
-    return input === undefined || output === undefined ? undefined : { input, output }
+    // Likewise an absent cache price is 0 and a present one that is not a number makes the tier unknown.
+    const read = cache?.read === undefined ? 0 : optNumber(cache.read)
+    const write = cache?.write === undefined ? 0 : optNumber(cache.write)
+    return cache === undefined || input === undefined || output === undefined || read === undefined || write === undefined ? undefined : { input: input + read + write, output }
   })
   const priced = tiers.filter((t) => t !== undefined)
   if (!priced.length || priced.length < tiers.length) return undefined

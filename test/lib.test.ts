@@ -4,7 +4,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { asArray, asObject, tokens, fit, bestMatch, percentiles, score, isFree, isEligible, looksSmall, classifyFailure, pick, orderCandidates, mergeState, mergeConfig, readJSON, writeJSONAtomic, loadConfig, loadPins, coolingUntil, split, decodeModel, decodeState, rankedIds, DEFAULT_CONFIG as cfg } from "../src/lib.mts"
+import { asArray, asObject, tokens, fit, bestMatch, percentiles, score, isFree, isEligible, key, looksSmall, classifyFailure, pick, orderCandidates, mergeState, mergeConfig, readJSON, writeJSONAtomic, loadConfig, loadPins, coolingUntil, split, decodeModel, decodeState, rankedIds, DEFAULT_CONFIG as cfg } from "../src/lib.mts"
 import type { FailureDecision, FailureInfo, ModelInfo, Pins } from "../src/lib.mts"
 
 test("config merge keeps nested defaults", () => {
@@ -37,6 +37,9 @@ const listed = (key: string) => {
   return asObject(m)
 }
 
+// The folded cost is a float sum, so compare it with a tolerance.
+const near = (c: { input: number; output: number } | undefined, input: number, output: number) => !!c && Math.abs(c.input - input) < 1e-9 && c.output === output
+
 test("decoding a model list entry", () => {
   assert.deepEqual(decodeModel(listed("opencode/nemotron-3.5-super-vl-free")), {
     id: "nemotron-3.5-super-vl-free",
@@ -49,7 +52,7 @@ test("decoding a model list entry", () => {
     limit: { context: 1048576 },
     capabilities: { toolcall: true },
   })
-  assert.deepEqual(decodeModel(listed("opencode/mistral-large-4"))?.cost, { input: 0.68, output: 2.09 })
+  assert.ok(near(decodeModel(listed("opencode/mistral-large-4"))?.cost, 0.68 + 0.07, 2.09), "cache prices are folded into the input price")
   // free/auto has no price at all, which is not the same as free.
   assert.equal(decodeModel(listed("free/auto"))?.cost, undefined)
 })
@@ -57,18 +60,37 @@ test("decoding a model list entry", () => {
 test("a model is free only when every context tier is", () => {
   const haiku = listed("opencode/claude-haiku-5-5")
   assert.equal(asArray(haiku.cost).length, 2, "the fixture is a tiered model")
-  assert.deepEqual(decodeModel(haiku)?.cost, { input: 0.5, output: 2.5 }, "the highest-priced tier is reported")
+  assert.ok(near(decodeModel(haiku)?.cost, 0.5 + 0.05 + 0.625, 2.5), "the highest-priced tier is reported")
   // No tiered model with a free first tier is on offer today; this is the shape a paid long-context tier would take.
   const tier = (input: number) => ({ tier: { type: "context", size: 100000 }, input, output: input, cache: { read: 0, write: 0 } })
   const free = { input: 0, output: 0, cache: { read: 0, write: 0 } }
   assert.deepEqual(decodeModel({ ...haiku, cost: [free, tier(3)] })?.cost, { input: 3, output: 3 })
   assert.deepEqual(decodeModel({ ...haiku, cost: [free, tier(0)] })?.cost, { input: 0, output: 0 })
+  const cached = (read: number, write: number) => ({ input: 0, output: 0, cache: { read, write } })
+  assert.deepEqual(decodeModel({ ...haiku, cost: [cached(0, 0)] })?.cost, { input: 0, output: 0 })
+  for (const c of [cached(0.1, 0), cached(0, 0.1)]) assert.ok(!isFree(decodeModel({ ...haiku, providerID: "opencode", cost: [c] }) as ModelInfo, cfg), "0/0 with a priced cache is not free")
+  assert.deepEqual(decodeModel({ ...haiku, cost: [{ input: 0, output: 0 }] })?.cost, { input: 0, output: 0 }, "an absent cache price is 0")
+  for (const bad of [{ read: "0.1" }, { write: null }, { read: 0, write: "0" }]) {
+    assert.equal(decodeModel({ ...haiku, cost: [{ input: 0, output: 0, cache: bad }] })?.cost, undefined, `${JSON.stringify(bad)}: a cache price that is not a number leaves the cost unknown`)
+  }
+  for (const bad of [0.1, null, "0", [0, 0]]) {
+    assert.equal(decodeModel({ ...haiku, cost: [{ input: 0, output: 0, cache: bad }] })?.cost, undefined, `${JSON.stringify(bad)}: a cache that is no object leaves the cost unknown`)
+  }
   assert.equal(decodeModel({ ...haiku, cost: [] })?.cost, undefined, "no tiers")
   assert.equal(decodeModel({ ...haiku, cost: [free, { input: 0 }] })?.cost, undefined, "a tier that does not decode")
   assert.equal(decodeModel({ ...haiku, cost: "0" })?.cost, undefined)
   const gone = decodeModel({ ...listed("opencode/nemotron-3.5-super-vl-free"), enabled: false })
   assert.equal(gone?.enabled, false)
   assert.ok(gone && !isEligible(gone, cfg, pins), "a disabled model is not eligible")
+})
+
+test("the router keys on a model's id, not its modelID", () => {
+  // Synthetic: every real entry has the two equal today. Derived from a real free entry.
+  const m = decodeModel({ ...listed("opencode/nemotron-3.5-super-vl-free"), id: "router-id-free", modelID: "upstream-name" })
+  assert.equal(m?.id, "router-id-free")
+  assert.ok(m)
+  assert.equal(key(m), "opencode/router-id-free")
+  assert.deepEqual(orderCandidates(["opencode/router-id-free", "opencode/upstream-name"], [m], cfg, pins), ["opencode/router-id-free"])
 })
 
 test("decoding models and state keeps the well-formed parts", () => {

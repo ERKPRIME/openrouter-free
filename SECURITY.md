@@ -29,7 +29,10 @@ GitHub Security Advisories:
   or `excludeProviders`.
 - **Logs.** `router.log` and `state.json` (both mode 0600) keep up to 200 characters of the error
   message a provider returned when a model failed. Some providers put a masked fragment of the API
-  key in such a message. The response body is only read to classify the failure, never kept. Keep
-  that in mind before sharing either file.
+  key in such a message. A failing hook also logs up to three stack frames: code locations with
+  local paths, which may include your username, no provider data. `router.log` also names session ids
+  and, when looking up a parent or fork source fails, up to 200 characters of opencode's own error
+  text for it. The response body is only read to classify the failure, never kept. Keep that in mind
+  before sharing either file.
 - **Remote data** (LMArena, Artificial Analysis, OpenRouter) is parsed as JSON and used only
   for scoring; it is never executed.

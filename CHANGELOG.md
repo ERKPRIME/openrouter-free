@@ -33,8 +33,14 @@ release. A `[minor]` or `[major]` marker in a commit subject picks the bump; oth
   longer keeps headers, request bodies or provider settings.
 - `router.log` and `state.json` keep up to 200 characters of a provider's error message, never its
   response body (SECURITY.md).
-- To go back to opencode 1.x: restore `"plugin": ["./plugin.ts"]` in `free.jsonc`, run the `install.sh`
-  of v0.1.2, then `rm -f "$dir/plugin/index.ts"; rmdir "$dir/plugin"` in the install directory.
+- To go back to opencode 1.x, first look at `free.jsonc` in the install directory. With a `"provider"`
+  block (the old format) whose plugin line this version's `install.sh` rewrote, replace
+  `"plugins": ["./plugin"]` with `"plugin": ["./plugin.ts"]`. With a `"providers"` block it was made
+  from this version's template with opencode 2 keys: move it aside (`mv "$dir/free.jsonc"
+  "$dir/free.jsonc.v2"`); v0.1.2's `install.sh` then creates a v1 one, and you carry any provider or
+  model settings of your own over by hand. Either way, run the `install.sh` of v0.1.2 (this version
+  deleted `plugin.ts`), then `rm -f "$dir/plugin/index.ts"; rmdir "$dir/plugin"` in the install
+  directory.
 
 ## 0.1.2 — 2026-09-30
 

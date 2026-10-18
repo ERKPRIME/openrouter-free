@@ -1,7 +1,7 @@
 // plugin/index.ts runs inside opencode; these tests load it in-process against a fake plugin context
 // (hooks captured, switches and metadata updates recorded, events pushed by hand) and an isolated
 // FREE_ROUTER_DIR.
-import { test, beforeEach, after } from "node:test"
+import { test, beforeEach, after, mock } from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
@@ -92,10 +92,13 @@ interface FakeOptions {
   sessions?: Record<string, SessionLike>
   defaultModel?: Ref | null
   switchModel?: (input: { sessionID: string; model: Ref }) => Promise<void>
+  update?: (input: { sessionID: string; metadata: unknown }) => Promise<void>
+  // Sessions opencode no longer has: asking for one fails.
+  deleted?: string[]
   subscribe?: RouterContext["event"]["subscribe"]
 }
 
-function fakeContext({ models = MODELS, sessions = {}, defaultModel = ref(FREE_AUTO), switchModel, subscribe }: FakeOptions = {}) {
+function fakeContext({ models = MODELS, sessions = {}, defaultModel = ref(FREE_AUTO), switchModel, update, deleted = [], subscribe }: FakeOptions = {}) {
   const state = new Map(Object.entries(sessions).map(([sid, s]) => [sid, structuredClone(s)]))
   const calls = { list: 0, switches: new Array<{ sessionID: string; model: Ref }>(), updates: new Array<{ sessionID: string; metadata: unknown }>() }
   const hooks: { prompt?: (e: SessionPrompt) => Promise<void> | void; retry?: (e: SessionRetry) => Promise<void> | void } = {}
@@ -111,7 +114,10 @@ function fakeContext({ models = MODELS, sessions = {}, defaultModel = ref(FREE_A
       default: async () => ({ data: defaultModel }),
     },
     session: {
-      get: async ({ sessionID }) => structuredClone(state.get(sessionID) ?? {}),
+      get: async ({ sessionID }) => {
+        if (deleted.includes(sessionID)) throw new Error(`no session ${sessionID}`)
+        return structuredClone(state.get(sessionID) ?? {})
+      },
       switchModel: async (input) => {
         await switchModel?.(input)
         calls.switches.push(input)
@@ -119,6 +125,7 @@ function fakeContext({ models = MODELS, sessions = {}, defaultModel = ref(FREE_A
       },
       // Like opencode's, this replaces the whole metadata object.
       update: async ({ sessionID, metadata }) => {
+        await update?.({ sessionID, metadata })
         calls.updates.push({ sessionID, metadata })
         state.set(sessionID, { ...state.get(sessionID), metadata })
       },
@@ -283,7 +290,7 @@ test("no free model leaves free/auto in place and fails fast", async () => {
   const broken = await start({ models: new Error("server down"), sessions: { s1: {} } })
   await broken.prompt("s1")
   const log = logText()
-  assert.match(log, /prompt hook failed s1: Error: server down/)
+  assert.match(log, /prompt hook failed s1: server down\n/)
   assert.equal(count(log, "ERROR no free model available for s1; free/auto left in place"), 3)
 })
 
@@ -356,7 +363,7 @@ test("failures are counted from the last switch", async () => {
   assert.equal(pickOf(p, "s1")?.id, "c-free")
 })
 
-test("two failures of the same model switch once, the late one is told not to retry on the old model", async () => {
+test("two failures of the same model switch once, the late one is retried on the new model", async () => {
   let release: () => void = () => {}
   const gate = new Promise<void>((r) => (release = r))
   const p = await start({ sessions: { s1: {} }, switchModel: async ({ model }) => (model.id === "b-free" ? gate : undefined) })
@@ -367,10 +374,212 @@ test("two failures of the same model switch once, the late one is told not to re
   await settle()
   release()
   assert.deepEqual(await first, IMMEDIATELY)
-  assert.deepEqual(await second, { retry: false }, "its request keeps the old model, which only fails again")
+  assert.deepEqual(await second, IMMEDIATELY, "the first late one is retried; the session is on the new pick")
   assert.equal(count(logText(), "failover "), 1)
   assert.equal(p.calls.switches.filter((s) => s.model.id === "b-free").length, 1)
   assert.equal(readState().cooldowns["opencode/a-free"]?.reason, "Free usage exceeded, subscribe to Go", "the late one adds no cooldown")
+})
+
+test("a request left on a model the session switched away from is retried once, then let fail", async () => {
+  // The primary request's failure switches first; an auxiliary request (a compaction keeps the model
+  // it started with) fails on the old model afterwards.
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
+  assert.deepEqual(await p.retry("s1", quota), IMMEDIATELY)
+  assert.deepEqual(await p.retry("s1", { ...quota, attempt: 3 }), IMMEDIATELY, "the first one may be the primary request that lost the race")
+  assert.deepEqual(await p.retry("s1", { ...quota, attempt: 4 }), { retry: false }, "the next ones only hit the provider that just failed")
+  assert.deepEqual(await p.retry("s1", { ...quota, attempt: 5 }), { retry: false })
+  assert.equal(count(logText(), "failover "), 1, "one switch, no more")
+  assert.equal(p.calls.switches.filter((s) => s.model.id === "b-free").length, 1)
+  assert.equal(Object.keys(readState().cooldowns).length, 1, "no cooldown for the late ones")
+
+  // A new execution starts over.
+  await p.emit("session.execution.started", "s1")
+  assert.deepEqual(await p.retry("s1", { ...quota, model: "opencode/b-free" }), IMMEDIATELY)
+  assert.equal(count(logText(), "failover "), 2)
+})
+
+test("a session that comes back to a model it left fails over from it again", async () => {
+  writeJSON("config.json", { maxSwitchesPerTurn: 3 })
+  const p = await start({ models: [listed("opencode/a-free"), listed("opencode/b-free")], sessions: { s1: {} } })
+  await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
+  assert.deepEqual(await p.retry("s1", quota), IMMEDIATELY)
+  assert.equal(pickOf(p, "s1")?.id, "b-free")
+  // Only A is left to go to; it is cooling, but it is all there is.
+  assert.deepEqual(await p.retry("s1", { ...quota, model: "opencode/b-free", attempt: 3 }), IMMEDIATELY)
+  assert.equal(pickOf(p, "s1")?.id, "a-free", "back on A")
+  assert.deepEqual(await p.retry("s1", { ...quota, attempt: 4 }), IMMEDIATELY)
+  assert.equal(pickOf(p, "s1")?.id, "b-free", "A is a pick again, not a model the session left: it fails over")
+  assert.equal(count(logText(), "failover "), 3)
+})
+
+test("an auxiliary failure that switches first leaves the primary's failure on the old model one retry", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
+  assert.deepEqual(await p.retry("s1", quota), IMMEDIATELY, "the auxiliary request: switches")
+  assert.equal(pickOf(p, "s1")?.id, "b-free")
+  assert.deepEqual(await p.retry("s1", { ...quota, attempt: 2 }), IMMEDIATELY, "the primary request: retried, and runs on the new pick")
+  assert.deepEqual(await p.retry("s1", { ...quota, attempt: 3 }), { retry: false }, "a third failure on the old model")
+  assert.equal(count(logText(), "failover "), 1)
+  assert.equal(p.calls.switches.filter((s) => s.model.id === "b-free").length, 1)
+})
+
+test("free/auto reaching the retry hook twice in one execution is retried once", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  await p.emit("session.execution.started", "s1")
+  const dead = { model: FREE_AUTO, type: "provider.transport", message: "ConnectionRefused", status: undefined as never }
+  assert.deepEqual(await p.retry("s1", dead), IMMEDIATELY)
+  assert.deepEqual(await p.retry("s1", { ...dead, attempt: 3 }), { retry: false }, "still on free/auto: the pick did not take")
+  assert.equal(p.calls.switches.length, 1)
+  await p.emit("session.execution.started", "s1")
+  assert.deepEqual(await p.retry("s1", { ...dead, attempt: 2 }), IMMEDIATELY, "a new execution may pick again")
+})
+
+test("a failover that stops half-way leaves the error to surface, not opencode's wait, and still spends the budget", async () => {
+  writeJSON("config.json", { maxSwitchesPerTurn: 1 })
+  const p = await start({
+    sessions: { s1: {} },
+    update: async () => {
+      if (p.calls.switches.length > 1) throw new Error("metadata down")
+    },
+  })
+  await p.prompt("s1")
+  const decision = await p.retry("s1", quota)
+  assert.deepEqual(decision, { retry: false }, "not the 15 minutes opencode would wait on a 429")
+  assert.equal(readState().cooldowns["opencode/a-free"]?.klass, "quota", "the model stays cooled")
+  assert.equal(pickOf(p, "s1")?.id, "b-free", "the switch itself went through")
+  assert.match(logText(), /retry hook failed s1: metadata down\n/)
+  assert.doesNotMatch(logText(), /failover s1/)
+
+  // The switch counted: the model it left is marked left, and the budget is spent.
+  assert.deepEqual(await p.retry("s1", { ...quota, attempt: 3 }), IMMEDIATELY, "a late request on the old model is retried once")
+  assert.deepEqual(await p.retry("s1", { ...quota, model: "opencode/b-free" }), { retry: false })
+  assert.match(logText(), /give up s1: already switched 1 times this turn; leaving opencode\/b-free/)
+})
+
+test("a half-done switch back to a model the session left does not leave that model marked left", async () => {
+  writeJSON("config.json", { maxSwitchesPerTurn: 3 })
+  let fail = false
+  const p = await start({
+    models: [listed("opencode/a-free"), listed("opencode/b-free")],
+    sessions: { s1: {} },
+    switchModel: async () => {
+      if (fail) throw new Error("switch down")
+    },
+    update: async () => {
+      if (fail) throw new Error("metadata down")
+    },
+  })
+  await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
+  assert.deepEqual(await p.retry("s1", quota), IMMEDIATELY)
+  fail = true
+  // Back to A, and the metadata write stops it half-way (the switch itself went through only if it ran).
+  assert.deepEqual(await p.retry("s1", { ...quota, model: "opencode/b-free", attempt: 3 }), { retry: false })
+  fail = false
+  p.state.set("s1", { ...p.state.get("s1"), model: ref("opencode/a-free") })
+  writeJSON("state.json", { cooldowns: {}, sessions: { s1: { model: "opencode/a-free", at: Date.now() } } })
+  assert.deepEqual(await p.retry("s1", { ...quota, attempt: 4 }), IMMEDIATELY)
+  assert.equal(pickOf(p, "s1")?.id, "b-free", "A is a pick, not a model the session left: it fails over")
+})
+
+test("a switch that is refused leaves the session where it was, spends the budget and marks the model left", async () => {
+  writeJSON("config.json", { maxSwitchesPerTurn: 1 })
+  let fail = false
+  const p = await start({
+    sessions: { s1: {} },
+    switchModel: async () => {
+      if (fail) throw new Error("switch down")
+    },
+  })
+  await p.prompt("s1")
+  fail = true
+  assert.deepEqual(await p.retry("s1", quota), { retry: false })
+  assert.equal(pickOf(p, "s1")?.id, "a-free", "still on the model it was on")
+  assert.match(logText(), /retry hook failed s1: switch down\n/)
+  assert.doesNotMatch(logText(), /failover s1/)
+
+  // Marked left: its next failure is retried once, then let fail.
+  assert.deepEqual(await p.retry("s1", { ...quota, attempt: 3 }), IMMEDIATELY)
+  assert.deepEqual(await p.retry("s1", { ...quota, attempt: 4 }), { retry: false })
+
+  // Spent: a failure on another pick of the session gives up without trying to switch.
+  writeJSON("state.json", { cooldowns: {}, sessions: { s1: { model: "opencode/c-free", at: Date.now() } } })
+  fail = false
+  assert.deepEqual(await p.retry("s1", { ...quota, model: "opencode/c-free", attempt: 5 }), { retry: false })
+  assert.match(logText(), /give up s1: already switched 1 times this turn; leaving opencode\/c-free/)
+})
+
+test("a deleted parent or fork source is nobody's pick", async () => {
+  const p = await start({
+    deleted: ["gone"],
+    sessions: { child: { parentID: "gone", model: ref("opencode/b-free") }, fork: { fork: { sessionID: "gone" }, model: ref("opencode/b-free") }, free: { parentID: "gone", model: ref(FREE_AUTO) } },
+  })
+  await p.prompt("child")
+  await p.prompt("fork")
+  assert.equal(p.calls.switches.length, 0, "not ours: it runs on a model nobody picked")
+  assert.deepEqual(await p.retry("child", { model: "opencode/b-free" }), { retry: true, delay: 900_000 })
+  await p.prompt("free")
+  assert.equal(pickOf(p, "free")?.id, "a-free", "free/auto is ours whatever its parent")
+  assert.doesNotMatch(logText(), /hook failed/)
+  assert.match(logText(), /session gone lookup failed: no session gone\n/, "the lookup that failed is logged")
+})
+
+test("a retry waits for the one before it on the session, but not for longer than 30 seconds", async (t) => {
+  mock.timers.enable({ apis: ["setTimeout"] })
+  t.after(() => mock.timers.reset())
+  let first = true
+  const p = await start({
+    sessions: { s1: {} },
+    // The first switch never comes back.
+    switchModel: async ({ model }) => {
+      if (model.id === "b-free" && first) {
+        first = false
+        await new Promise(() => {})
+      }
+    },
+  })
+  await p.prompt("s1")
+  void p.retry("s1", quota)
+  await settle()
+  let second: unknown
+  void p.retry("s1", { ...quota, message: "Free usage exceeded again" }).then((d) => (second = d))
+  await settle()
+  assert.equal(second, undefined, "queued behind the hung one")
+  mock.timers.tick(29_000)
+  await settle()
+  assert.equal(second, undefined)
+  mock.timers.tick(1_000)
+  await settle()
+  assert.deepEqual(second, IMMEDIATELY, "ran anyway")
+})
+
+test("a deleted session is forgotten", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  await p.emit("session.execution.started", "s1")
+  await p.prompt("s1")
+  assert.equal(p.calls.switches.length, 0, "busy")
+  await p.emit("session.deleted", "s1")
+  await p.prompt("s1")
+  assert.equal(p.calls.switches.length, 1, "its turn record is gone, so it is not busy")
+})
+
+test("hook failures are logged cut to 200 characters with a few stack frames", async () => {
+  const p = await start({
+    sessions: { s1: {} },
+    switchModel: async () => {
+      throw new Error(`server said ${"x".repeat(500)}`)
+    },
+  })
+  await p.prompt("s1")
+  const lines = logText().split("\n").filter(Boolean)
+  assert.ok(lines.every((l) => l.length < 400))
+  assert.match(lines[0] ?? "", /prompt hook failed s1: server said x{188}$/)
+  assert.ok(lines.length >= 2 && lines.length <= 4, "the failure and at least one, at most three, frames")
+  assert.ok(lines.slice(1).every((l) => /^ {4}at /.test(l)))
 })
 
 test("failovers stop at maxSwitchesPerTurn and when nothing else is left; a new execution gets a new budget", async () => {
@@ -428,8 +637,10 @@ test("autoContinue off switches the model but leaves the next message to the use
   writeJSON("config.json", { autoContinue: false })
   const p = await start({ sessions: { s1: {} } })
   await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
   assert.deepEqual(await p.retry("s1"), { retry: false })
   assert.match(logText(), /switched s1 to opencode\/b-free; autoContinue off, next message will use it\n/)
+  assert.deepEqual(await p.retry("s1", { attempt: 3 }), { retry: false }, "nothing retries on the old model mid-turn either")
   assert.equal(readState().sessions.s1?.model, "opencode/b-free")
 })
 
@@ -451,14 +662,14 @@ test("model list, switch and metadata failures are logged, never thrown", async 
     },
   })
   await p.prompt("s2")
-  assert.match(logText(), /prompt hook failed s2: Error: switch down/)
+  assert.match(logText(), /prompt hook failed s2: switch down\n {4}at /)
   await p.prompt("s1")
   assert.equal(await p.retry("s2", { model: FREE_AUTO }).then(() => "returned"), "returned")
-  assert.match(logText(), /retry hook failed s2: Error: switch down/)
+  assert.match(logText(), /retry hook failed s2: switch down\n/)
 
   const q = await start({ models: new Error("list down"), sessions: { s3: { model: ref("opencode/a-free"), metadata: { freeRouter: { pick: "opencode/a-free" } } } } })
   assert.equal(await q.retry("s3").then(() => "returned"), "returned")
-  assert.match(logText(), /retry hook failed s3: Error: list down/)
+  assert.match(logText(), /retry hook failed s3: list down\n/)
 })
 
 test("a throwing event handler is logged by type and message only", async () => {
@@ -533,6 +744,7 @@ test("a stale ranking is refreshed in the background, one run at a time", async 
 
   await start()
   assert.equal(refreshes(), 1)
+  assert.equal(fs.statSync(file("router.log")).mode & 0o777, 0o600, "a log the refresh created is private")
   assert.equal(fs.readFileSync(lock, "utf8"), String(process.pid))
   await until(() => spawned().endsWith("\n"), "rank.mts spawn")
   assert.equal(spawned(), `node ${file("rank.mts")} --quiet --lock ${lock}\n`)
@@ -561,6 +773,21 @@ test("a stale ranking is refreshed in the background, one run at a time", async 
   fs.utimesSync(lock, old, old)
   await start()
   assert.match(logText(), /refresh check failed: EISDIR/)
+})
+
+test("a log from an older install is made private, at startup and when it rotates", async () => {
+  fs.writeFileSync(file("router.log"), "old\n")
+  fs.chmodSync(file("router.log"), 0o644)
+  await start()
+  assert.equal(fs.statSync(file("router.log")).mode & 0o777, 0o600)
+
+  fs.writeFileSync(file("router.log"), "x".repeat((1 << 20) + 1))
+  fs.chmodSync(file("router.log"), 0o644)
+  const p = await start({ models: [], sessions: { s1: {} } })
+  fs.chmodSync(file("router.log"), 0o644)
+  await p.prompt("s1")
+  assert.equal(fs.statSync(file("router.log.1")).mode & 0o777, 0o600, "the rotated copy")
+  assert.equal(fs.statSync(file("router.log")).mode & 0o777, 0o600)
 })
 
 test("the log rotates past 1 MiB and a broken log never breaks the plugin", async () => {

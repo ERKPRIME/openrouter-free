@@ -78,6 +78,19 @@ fail() {
 # The model a session is stuck to, from the router's state file.
 pick_of() { node -e 'const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); console.log(s.sessions[process.argv[2]]?.model ?? "")' "$work/state.json" "$1"; }
 
+# Whether a --format json output holds an assistant text event with $2: the echoed prompt does not count.
+said() {
+  node -e '
+    for (const line of require("fs").readFileSync(process.argv[1], "utf8").split("\n")) {
+      try {
+        const e = JSON.parse(line)
+        if (e.type === "text" && String(e.part?.text ?? "").includes(process.argv[2])) process.exit(0)
+      } catch {}
+    }
+    process.exit(1)
+  ' "$1" "$2"
+}
+
 oc run --standalone --format json "Reply with exactly: e2e-one" >"$work/one.json" || fail "turn 1 did not finish within ${limit}s"
 sid=$(node -e '
   for (const line of require("fs").readFileSync(process.argv[1], "utf8").split("\n")) {
@@ -88,7 +101,7 @@ sid=$(node -e '
   }
 ' "$work/one.json")
 [ -n "$sid" ] || fail "no session id in the turn 1 output"
-grep -q 'e2e-one' "$work/one.json" || fail "no reply after failover"
+said "$work/one.json" e2e-one || fail "no reply after failover"
 first=$(pick_of "$sid")
 case "$first" in "" | fakefree/*) fail "turn 1 was not answered by a real model (session on '$first')" ;; esac
 grep -q '"fakefree/broken"' "$work/state.json" || fail "fake model not on cooldown"
@@ -100,8 +113,8 @@ node -e '
   s.cooldowns = {}
   require("fs").writeFileSync(f, JSON.stringify(s))
 ' "$work/state.json"
-oc run --standalone --session "$sid" "Reply with exactly: e2e-two" >"$work/two.txt" || fail "turn 2 did not finish within ${limit}s"
-grep -q 'e2e-two' "$work/two.txt" || fail "no reply to second turn"
+oc run --standalone --format json --session "$sid" "Reply with exactly: e2e-two" >"$work/two.json" || fail "turn 2 did not finish within ${limit}s"
+said "$work/two.json" e2e-two || fail "no reply to second turn"
 second=$(pick_of "$sid")
 [ "$second" = "$first" ] || fail "second turn moved from $first to $second"
 echo "ok  sticky: second turn stayed on $second"

@@ -49,12 +49,13 @@ refuse_command() {
 }
 
 refuse_service() {
-  echo "opencode-free: can't run the shared background service; use opencode-free for the TUI or opencode-free acp for editors and bb" >&2
+  echo "opencode-free: can't run the shared background service, and refuses --service anywhere in the arguments (quote it inside a message); use opencode-free for the TUI or opencode-free acp for editors and bb" >&2
   exit 2
 }
 
 # One scan of the arguments. `sub`: the first word that is a subcommand. `at`: the argument after
-# which --standalone goes: the subcommand, or for a command group its own subcommand (`session list`).
+# which --standalone goes: the subcommand, or for a command group its own subcommand (`session list`;
+# a bare `session` takes it after itself).
 sub=""
 at=0
 skip=0
@@ -62,13 +63,14 @@ group=0
 i=0
 for a; do
   i=$((i + 1))
+  # Checked before the skip: a flag's value does not hide --service.
+  case "$a" in --service | --service=*) refuse_service ;; esac
   if [ "$skip" = 1 ]; then
     skip=0
     continue
   fi
   case "$a" in
     --) break ;;
-    --service) refuse_service ;;
     --*=*) continue ;;
     -*)
       if takes_value "$a"; then skip=1; fi
@@ -90,7 +92,7 @@ for a; do
     acp | serve) sub=$a ;;
     upgrade | update | uninstall | debug | pair | mcp | plugin) refuse_command "$a" ;;
     api | models | stats | mini | run | reload) sub=$a at=$i ;;
-    session | auth) sub=$a group=1 ;;
+    session | auth) sub=$a at=$i group=1 ;;
     service) refuse_service ;;
   esac
 done

@@ -172,7 +172,7 @@ minutes on a rate limit. So when a request fails, the plugin looks at the error 
 retries:
 
 1. If the model is to blame, it goes on cooldown, until `retry-after` if the provider sends one,
-   otherwise the default above. A quota message, a removed model, or a refusal fails over at once; a
+   otherwise the default above. A quota message, a removed model, or an auth or permission rejection (401/403) fails over at once; a
    rate limit or a server error after the second try, or at once when the wait would be over a minute.
    A context overflow, a cut-off answer or a content filter are not the model's fault and stay with
    opencode.
