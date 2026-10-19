@@ -6,6 +6,8 @@ release. A `[minor]` or `[major]` marker in a commit subject picks the bump; oth
 
 ## Unreleased
 
+## 0.1.3 — 2026-10-19
+
 - **Breaking: opencode 2 only.** The plugin is ported to opencode 2's plugin API; opencode 1.x is no
   longer supported and `install.sh` refuses it. After upgrading opencode, **re-run `install.sh`**: it
   installs the plugin as `plugin/index.ts`, removes the old `plugin.ts`, and rewrites the one-line
