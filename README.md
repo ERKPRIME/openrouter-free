@@ -11,20 +11,25 @@ You pick one model, `free/auto`, and the plugin does the rest:
 - **Ranked, not random.** Every free model opencode can reach is scored with
   [LMArena](https://huggingface.co/datasets/lmarena-ai/leaderboard-dataset) (agent, webdev and text
   boards) and [Artificial Analysis](https://artificialanalysis.ai) (coding, agentic and intelligence
-  indices). New stealth models that have no benchmarks yet, like the ones OpenRouter and OpenCode Zen
-  run for a week, are detected and placed near the top.
-- **Sticky.** A session keeps its model. It doesn't switch on every request. When a better model shows up, new sessions get it.
-- **Fails over.** When the model hits its quota or rate limit, gets removed, or is refused, it goes on
-  cooldown and the session moves to the next-ranked model. The interrupted task then continues automatically.
-- **Only free.** Free providers are an explicit allowlist, and each pick is re-checked against
-  live provider data. Subscription plans that report a price of 0 are never used.
+  indices). New stealth models with no benchmarks yet, like the ones OpenRouter and OpenCode Zen run
+  for a week, are detected and placed near the top.
+- **Sticky.** A session keeps its model. It does not switch on every request. When a better model
+  appears, new sessions get it.
+- **Fails over.** When the model hits its quota or rate limit, is removed, or is refused, it goes on
+  cooldown and the session moves to the next-ranked model. The interrupted task continues
+  automatically, in the same turn.
+- **Only free.** Free providers are an explicit allowlist, and each pick is re-checked against live
+  provider data. Subscription plans that report a price of 0 are never used.
 
-```
+```text
 $ opencode-free run "explain this repo"
 > build · space-bunny-free
 ```
 
-## Install
+This repository is the Windows-native adaptation of
+[lettland/opencode-free-router](https://github.com/lettland/opencode-free-router). It keeps the
+original Linux/macOS behavior and adds first-class native Windows support. Read the
+[Spanish README](README.es.md).
 
 Requires **opencode 2** (`opencode --version` says 2.x) and Node 22.18+ (or Bun), on macOS, Linux or
 Windows. The code is TypeScript and ships as source: opencode loads the plugin directly, and Node
@@ -121,75 +126,133 @@ be quoted, because an unquoted word `service` in it is refused too:
 openrouter-free run "restart the service"    # not: openrouter-free run restart the service
 ```
 
+The wrapper exits with `127` and a clear message when `opencode` is not on `PATH`. `--list-models`
+still works in that case.
+
+### Windows argument handling
+
+The `.cmd` shim always runs the PowerShell launcher in a child process, so it does not leak
+`OPENCODE_CONFIG` or `FREE_ROUTER_DIR` into your PowerShell session. The launcher quotes every
+argument. These forms are supported and tested:
+
+- spaces and non-ASCII paths/arguments;
+- `&`, `|`, `<`, `>`, `^`, `!` inside an argument;
+- embedded double quotes and empty arguments;
+- arguments with trailing backslashes.
+
+Known `cmd.exe` limitations, not bugs in the launcher:
+
+- `%NAME%` is expanded by `cmd.exe` before the launcher sees it. Escape or avoid literal percent
+  signs in arguments.
+- Newlines cannot be passed through a `.cmd` argument.
+
+The PowerShell launcher deliberately is not named `opencode-free.ps1`; it is installed as
+`opencode-free-launcher.ps1`. PowerShell resolves a bare `.ps1` name in the current session, which
+would leak the router environment into your shell. The `.cmd` shim is the only `opencode-free`
+command.
+
+## bb
+
+On POSIX, `./scripts/install.sh --bb` registers a custom ACP agent **Free (auto)** (provider
+`acp-free`) that runs `opencode-free acp`. Pick `free/auto` as its model. No other bb agent is
+touched. If an older install shows only "Agent default" as the model, re-run `./scripts/install.sh
+--bb`.
+
+The native Windows installer has no `-bb` switch. To use bb on Windows, point an ACP agent at
+`opencode-free.cmd acp` and select `free/auto`; re-running the Windows installer does not touch bb's
+configuration.
+
+A failover happens inside the running prompt, so bb sees one prompt answered by the new model; it
+does not receive a queued "continue" message.
+
 ## Which free models
 
-Without any keys you get OpenCode Zen's free models. Each key you add grows the pool:
+Without keys you get OpenCode Zen's free models. Each key you add grows the pool:
 
 | Provider | Key | What counts as free |
 |---|---|---|
 | OpenCode Zen | none | models priced 0 (`*-free`, big-pickle, …) |
-| OpenRouter | `OPENROUTER_API_KEY` | `:free` models (its routers like `openrouter/auto` are excluded) |
+| OpenRouter | `OPENROUTER_API_KEY` | `:free` models (routers such as `openrouter/auto` are excluded) |
 | NVIDIA | `NVIDIA_API_KEY` | models priced 0 on build.nvidia.com |
 | Z.AI | `ZHIPU_API_KEY` | models priced 0 (GLM-4.7-Flash, GLM-4.5-Flash, GLM-4.6V-Flash) |
 | Zhipu AI | `ZHIPU_API_KEY` | the same free GLM Flash models, for a China (BigModel) account |
-| ModelScope | `MODELSCOPE_API_KEY` | models priced 0, which is all of them (2,000 requests a day) |
-| Mistral | `MISTRAL_API_KEY` | Devstral Small, Codestral and Mistral Small, via the free Experiment plan |
-| Groq | `GROQ_API_KEY` | all models, via the free tier |
-| Cerebras | `CEREBRAS_API_KEY` | all models, via the free tier |
-| Google AI Studio | `GOOGLE_GENERATIVE_AI_API_KEY` | Flash and Gemma models, via the free tier |
+| ModelScope | `MODELSCOPE_API_KEY` | all models (priced 0; 2,000 requests a day) |
+| Mistral | `MISTRAL_API_KEY` | Devstral Small, Codestral and Mistral Small via the free Experiment plan |
+| Groq | `GROQ_API_KEY` | all models via the free tier |
+| Cerebras | `CEREBRAS_API_KEY` | all models via the free tier |
+| Google AI Studio | `GOOGLE_GENERATIVE_AI_API_KEY` | Flash and Gemma models via the free tier |
 
-Keys you already have through `opencode auth login` or your shell environment just work. Otherwise
-put them in `~/.config/opencode/free-router/providers.env`. That also covers launches that don't read
-your shell profile, like bb or GUI apps. **Use free-plan accounts**: Groq, Cerebras, Google and
-Mistral models count as free because of their free tiers, so a key with billing enabled may be
-charged.
+Keys you already have through `opencode auth login` or your shell work automatically. Otherwise put
+them in `~/.config/opencode/free-router/providers.env` (or the Windows install directory). This also
+covers launches that do not read your shell profile, such as bb or GUI applications.
 
-The four additions have their own caveats:
+**Use free-plan accounts.** Groq, Cerebras, Google and Mistral models count as free because of their
+free tiers, so a key with billing enabled may be charged.
+
+Notes on the extra providers:
 
 - **Z.AI / Zhipu.** The free GLM Flash models are free for every account, not trial credits. The
-  catch is throughput: one request at a time, about one a second. They are two separate platforms
-  sharing one variable, `ZHIPU_API_KEY`: a z.ai key only works on `zai`, a BigModel (China) key only
-  on `zhipuai`. opencode reads the key for both, the wrong endpoint answers 401, and that provider
-  goes on a 24-hour cooldown, so exactly one of the two ever reaches the pool.
+  catch is throughput: roughly one request at a time, about one a second. They are two separate
+  platforms sharing one variable, `ZHIPU_API_KEY`: a z.ai key only works on `zai`, a BigModel
+  (China) key only on `zhipuai`. The wrong endpoint returns 401 and that provider goes on a
+  24-hour cooldown, so exactly one of the two reaches the pool.
 - **ModelScope.** Everything it serves is free, with a quota of 2,000 requests a day (500 per model)
   and no card, but signup wants a phone number and the endpoint is fastest inside Asia.
 - **Mistral.** The Experiment plan (no card, 1B tokens a month, 1 request a second) covers Devstral
   Small 2, Codestral and Mistral Small, but the catalog prices them, so the router matches them by
-  name. Right now that means Codestral and Mistral Small: every Devstral entry Mistral lists is
-  marked deprecated, including its only 0-priced one, and the router skips those. The Devstral glob
-  is there for the first current Devstral Small that appears. Tune the families in `config.json` if
-  Mistral changes the plan:
+  name. Every Devstral entry Mistral lists is currently marked deprecated, including its only
+  0-priced one, so the router skips those. The Devstral glob is there for the first current Devstral
+  Small that appears. Tune the families in `config.json` if Mistral changes the plan:
   `{"mistral": ["$zero", "devstral-small*", "codestral*", "mistral-small*"]}`.
 
 Left out on purpose, because a price of 0 there does not mean free: Cloudflare Workers AI (10,000
 neurons a day, and the models its free plan dropped now answer 403, which would bench the whole
-provider), Vercel AI Gateway (the free credits need a payment method, and the catalog marks Llama
-models as 0 that Vercel actually prices), Hugging Face ($0.10 of monthly credits), and the many
-gateway clones that list every model at 0.
+provider), Vercel AI Gateway (free credits need a payment method, and the catalog marks Llama models
+as 0 that Vercel actually prices), Hugging Face ($0.10 of monthly credits), and the many gateway
+clones that list every model at 0.
 
 An optional `ARTIFICIAL_ANALYSIS_API_KEY` in `ranker.env` adds Artificial Analysis scores (free key,
 100 requests a day; the ranker uses a few per refresh). Without it, ranking uses LMArena only.
 
+`ranker.env` is read only by `rank.mts`. It is parsed into the ranker's own process environment and
+is not exported to opencode or the agent's tools. The Artificial Analysis key is also removed from
+the environment of the child process that lists models.
+
 ## How ranking works
 
 `rank.mts` writes `ranking.json`. The plugin re-runs it in the background whenever the file is older
-than `refreshHours` (6).
+than `refreshHours` (6), one refresh at a time.
 
-1. It lists the models opencode can reach (`opencode api --standalone model.list`) and keeps the ones that
-   are free, can call tools, are enabled, and have at least 64k context. A model with several price
-   tiers counts as free only if every tier is.
+1. It lists the models opencode can reach (`opencode api --standalone model.list`) and keeps the ones
+   that are free, can call tools, are enabled, and have at least 64k context. A model with several
+   price tiers counts as free only if every tier is.
 2. It matches each model against the leaderboards by name. `mimo-v2.6-flash` never matches
    `mimo-v2.6-pro`, and AA's `ling-3-0-flash-fin` matches `ling-3.0-flash-fin-free`.
 3. Each source becomes a percentile. The score is the weighted mean over the sources that matched.
-4. Models with no benchmarks: stealth models (OpenRouter's `stealth/` listing) score 0.95. Others
-   score about 0.25–0.35, less for small models, so an unknown 2B preview never beats a
-   benchmarked model.
+4. Models with no benchmarks: stealth models (OpenRouter's `stealth/` listing) score `stealthScore`
+   (0.95). Others score about 0.25–0.35, less for small models, so an unknown 2B preview never beats
+   a benchmarked model.
 
 ```sh
 node %APPDATA%\openrouter-free\rank.mts --status    # npm on Windows
 node ~/.config/openrouter-free/rank.mts --status   # npm on Linux
 node "$HOME/Library/Application Support/openrouter-free/rank.mts" --status  # npm on macOS
 node ~/.config/opencode/free-router/rank.mts --status  # scripts/install.sh
+```
+
+Commands:
+
+```text
+Usage: rank.mts [options]
+
+  (no options)             refresh ranking.json and print a one-line summary
+  --status                 print ranking.json, cooldowns and recent session picks
+  --quiet                  refresh, printing only warnings
+  --config <free.jsonc>    opencode config to list models with (default: free.jsonc here)
+  --lock <file>            remove this lock file when done (set by the plugin)
+  -h, --help               show this help
+
+Exit codes: 0 success, 1 refresh failed, 2 invalid command line.
 ```
 
 ### Overrides: `pins.json`
@@ -202,24 +265,31 @@ node ~/.config/opencode/free-router/rank.mts --status  # scripts/install.sh
 }
 ```
 
-`pin` forces models to the top in that order, `ban` never uses them, and `alias` fixes a missed benchmark
-match. Run `rank.mts` after editing.
+`pin` forces models to the top in that order, `ban` never uses them, and `alias` fixes a missed
+benchmark match. Duplicate IDs are removed after pinning. Run `rank.mts` after editing.
 
 ### Settings: `config.json`
 
-Everything is optional. Nested maps merge with the defaults key by key.
+Everything is optional. Nested maps merge with the defaults key by key. Values of the wrong type fall
+back to the default.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `freeTier` | see table above | allowlist: provider → model globs; `"$zero"` = models priced 0 |
 | `excludeProviders` | `[]` | never use these, e.g. `["openrouter"]` for sensitive code |
 | `minContext` | `64000` | minimum context window |
-| `weights` | agent 0.35, webdev 0.35, text 0.15, AA coding 0.25, agentic 0.25, intelligence 0.15 | score weights |
+| `weights` | `arena_agent 0.35, arena_webdev 0.35, arena_text 0.15, aa_coding 0.25, aa_agentic 0.25, aa_intelligence 0.15` | score weights |
 | `stealthScore` | `0.95` | score for unbenchmarked stealth models |
+| `unscoredBase` | `0.25` | base score for other unbenchmarked models |
+| `unscoredRecencyMax` | `0.1` | maximum recency bonus for unbenchmarked models |
+| `smallPenalty` | `0.15` | penalty for small models |
 | `cooldownMinutes` | quota 360, rate 10, server 5, unavailable 1440 | how long a failed model sits out, unless `retry-after` says longer |
 | `maxSwitchesPerTurn` | `3` | failover budget per message |
 | `autoContinue` | `true` | retry the failed turn on the next model; `false` fails the turn instead and the next message uses the new model |
 | `refreshHours` | `6` | re-rank when `ranking.json` is older than this |
+
+Malformed cache or state data is ignored per entry instead of breaking the router. A cache timestamp
+in the future is treated as stale, and temporary files from atomic writes are cleaned up on failure.
 
 ## Failover in detail
 
@@ -228,21 +298,22 @@ minutes on a rate limit. So when a request fails, the plugin looks at the error 
 retries:
 
 1. If the model is to blame, it goes on cooldown, until `retry-after` if the provider sends one,
-   otherwise the default above. A quota message, a removed model, or an auth or permission rejection (401/403) fails over at once; a
-   rate limit or a server error after the second try, or at once when the wait would be over a minute.
-   A context overflow, a cut-off answer or a content filter are not the model's fault and stay with
-   opencode.
-2. The session moves to the next-ranked model that isn't cooling down. If every model is cooling down, it
-   uses the one that frees up first.
+   otherwise the default above. A quota message, a removed model, or an auth/permission rejection
+   (401/403) fails over at once; a rate limit or server error fails over after the second try, or at
+   once when the wait would be over a minute. A context overflow, a cut-off answer or a content
+   filter is not the model's fault and is left to opencode.
+2. The session moves to the next-ranked model that is not cooling down. If every model is cooling
+   down, it uses the one that frees up first.
 3. opencode retries the same request on the new model straight away, in the same turn. The partial
-   answer of a request cut off half-way stays in the conversation and the new model continues from it.
+   answer of a request cut off half-way stays in the conversation and the new model continues from
+   it.
 
-At most `maxSwitchesPerTurn` switches happen per turn; after that the provider's error is shown at once
-instead of being waited out. With `autoContinue` off the turn fails and the next message runs on the
-new model.
+At most `maxSwitchesPerTurn` switches happen per turn; after that the provider's error is shown at
+once instead of being waited out. With `autoContinue` off, the turn fails and the next message runs
+on the new model.
 
-**A failover sends the whole conversation to the next free provider without asking.** Everything said
-in the session so far goes to the new model's provider, with that provider's data terms (see Privacy).
+**A failover sends the whole conversation to the next free provider without asking.** Everything
+said in the session so far goes to the new model's provider, under that provider's data terms.
 
 Where you can see a switch: the model shown by the TUI, the model ACP clients report, `router.log`
 (`failover ...`) and `rank.mts --status`. There is no extra message in the conversation.
@@ -258,22 +329,42 @@ No other bb agent is touched. If an older install shows only "Agent default" as 
 installer with `--bb`. A failover happens inside the running prompt, so bb sees one prompt answered by
 the new model; it no longer receives a queued "continue" message.
 
-## Privacy
+## Privacy and security
 
 **Free models are usually paid for with your data.** Assume prompts and completions may be logged or
 used for training:
 
-- On OpenCode Zen, most free models are explicit exceptions to Zen's zero-retention policy. During the
-  free period, data "may be used to improve the model" (Big Pickle, MiMo Flash, Ling Flash Fin). NVIDIA's free
-  endpoints log usage ("do not submit personal or confidential data"). "Contributor" models such as
-  Muse Spark Contributor Free train on your prompts. Some stealth models state zero retention. Check
-  [Zen's privacy notes](https://opencode.ai/docs/zen/) for the current list.
+- On OpenCode Zen, most free models are explicit exceptions to Zen's zero-retention policy. During
+  the free period, data "may be used to improve the model" (Big Pickle, MiMo Flash, Ling Flash Fin).
+  NVIDIA's free endpoints log usage ("do not submit personal or confidential data"). "Contributor"
+  models such as Muse Spark Contributor Free train on your prompts. Some stealth models state zero
+  retention. Check [Zen's privacy notes](https://opencode.ai/docs/zen/) for the current list.
 - On OpenRouter, free providers may keep prompts.
 - Groq, Cerebras, Google and Mistral free tiers follow each provider's own terms. So do Z.AI's free
   GLM Flash models and ModelScope's free inference.
 
-Don't point `free/auto` at confidential or client code. To narrow the pool, `ban` specific models in
-`pins.json` or list whole providers in `excludeProviders`. See [SECURITY.md](SECURITY.md).
+Do not point `free/auto` at confidential or client code. Narrow the pool with `ban` in `pins.json`
+or list whole providers in `excludeProviders`. See [SECURITY.md](SECURITY.md).
+
+Security-relevant behavior of this implementation:
+
+- `providers.env` is exported into opencode, so the agent's tools can read those keys, like any
+  opencode provider key. `ranker.env` is not exported; it is read only by `rank.mts`.
+- On POSIX, key files and state/log files are created with mode `0600`. On Windows, the installer
+  restricts the install directory and user files to the current user, `SYSTEM` and the built-in
+  `Administrators` group. ACL restriction is best effort: on FAT/exFAT, some network shares or
+  policy-locked profiles it warns and leaves the install usable.
+- `router.log` is timestamped per line. Both `router.log` and `state.json` redact common credential
+  shapes. Error text is cut to 200 characters. Stack frames are cut to three. The response body is read only to
+  classify a failure, never stored. Logs still contain session IDs, local paths and possibly a
+  provider's masked key fragment; review before sharing.
+- `cache/candidates.json` strips headers, request bodies and provider settings.
+- The Windows installer requires a `.opencode-free-router.json` marker before `-Purge` recursively
+  deletes a directory. `-Force` is the explicit escape hatch for legacy marker-less installs.
+- The uninstaller removes only shims that reference this install directory, and a normal uninstall
+  removes only known code files and an empty `plugin` directory.
+- `writeJSONAtomic` removes its temporary file when a rename fails. The ranker caps leaderboard
+  pagination so a broken or endless endpoint cannot page forever.
 
 ## Troubleshooting
 
@@ -288,10 +379,10 @@ Don't point `free/auto` at confidential or client code. To narrow the pool, `ban
 ```sh
 npm ci --ignore-scripts       # compiler and type definitions, for npm run check only
 npm run check                 # type-check (TypeScript 7, strict)
-npm test                      # unit tests (no network, no opencode 2)
-npm run test:coverage         # same, plus coverage/lcov.info (Node 26+)
-npm run lint:sh               # shellcheck
-./scripts/e2e-failover.sh     # real opencode 2 + a fake 429 provider: failover, stickiness, fail-fast
+npm test                      # tests; no network and no real opencode needed
+npm run test:coverage         # tests plus coverage/lcov.info (cross-platform coverage runner)
+npm run lint:sh               # shellcheck (requires shellcheck)
+./scripts/e2e-failover.sh     # POSIX: real opencode 2 + a fake 429 provider
 ```
 
 ## Update and uninstall

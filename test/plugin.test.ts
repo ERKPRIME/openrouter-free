@@ -8,6 +8,7 @@ import os from "node:os"
 import path from "node:path"
 import type { SessionPrompt, SessionRetry } from "@opencode/plugin/promise/session"
 import type { RouterContext, SessionLike } from "../src/plugin/index.ts"
+import { assertPrivateAcl } from "./fixtures/acl.ts"
 
 const DIR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "free-router-plugin-")))
 process.env.FREE_ROUTER_DIR = DIR
@@ -40,6 +41,16 @@ const writeJSON = (name: string, data: unknown) => fs.writeFileSync(file(name), 
 const readState = () => decodeState(readJSON(file("state.json")))
 const logText = () => (fs.existsSync(file("router.log")) ? fs.readFileSync(file("router.log"), "utf8") : "")
 const count = (text: string, needle: string) => text.split(needle).length - 1
+
+// On POSIX a router file is 0600. Windows has no mode bits for privacy: Node only maps the write
+// bit, and the file inherits the profile ACL (owner, SYSTEM, Administrators). Check that ACL.
+function assertPrivate(name: string) {
+  if (process.platform === "win32") {
+    assertPrivateAcl(file(name), name)
+  } else {
+    assert.equal(fs.statSync(file(name)).mode & 0o777, 0o600, `${name} is private`)
+  }
+}
 
 async function settle() {
   for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r))
@@ -303,6 +314,31 @@ test("free/auto reaching the retry hook (a command the prompt hook never routed)
   assert.deepEqual(readState().cooldowns, {}, "the placeholder is not a failed model")
 })
 
+test("the retry hook logs the model and opencode's proposal before deciding", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
+
+  await p.retry("s1", { delay: 3000 })
+  assert.match(logText(), /retry hook s1: opencode\/a-free attempt 2, opencode proposes retry\n/)
+
+  await p.retry("s1", { ...quota, retry: false, attempt: 3 })
+  assert.match(logText(), /retry hook s1: opencode\/a-free attempt 3, opencode proposes stop\n/)
+})
+
+test("a retry on a model the router did not pick is logged instead of failing over", async () => {
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  const switches = p.calls.switches.length
+
+  // A /model choice differs from the pick, so routing ends there: the hook must say so, not switch.
+  const decision = await p.retry("s1", { model: "opencode/c-free", ...quota })
+  assert.deepEqual(decision, { retry: true, delay: 900_000 }, "opencode's own decision is left alone")
+  assert.equal(p.calls.switches.length, switches, "the session is not moved")
+  assert.match(logText(), /retry hook s1: opencode\/c-free attempt 2, opencode proposes retry\n/)
+  assert.match(logText(), /retry hook s1: opencode\/c-free is not this session's pick; routing is off, no failover\n/)
+})
+
 test("a failure that exhausts the model switches in place and retries at once", async () => {
   const p = await start({ sessions: { s1: {} } })
   await p.prompt("s1")
@@ -528,6 +564,19 @@ test("a deleted parent or fork source is nobody's pick", async () => {
   assert.match(logText(), /session gone lookup failed: no session gone\n/, "the lookup that failed is logged")
 })
 
+test("a cyclic parent graph terminates instead of recursing forever", async () => {
+  writeJSON("state.json", { cooldowns: {}, sessions: { a: { model: "opencode/b-free", at: Date.now() }, b: { model: "opencode/b-free", at: Date.now() } } })
+  const p = await start({
+    sessions: {
+      a: { parentID: "b", model: ref("opencode/a-free") },
+      b: { parentID: "a", model: ref("opencode/b-free") },
+    },
+  })
+  assert.deepEqual(await p.retry("a", { model: "opencode/a-free" }), { retry: true, delay: 900_000 }, "not our pick: opencode keeps its decision")
+  assert.equal(p.calls.switches.length, 0)
+  assert.doesNotMatch(logText(), /lookup failed|hook failed/, "the cycle is not an error")
+})
+
 test("a retry waits for the one before it on the session, but not for longer than 30 seconds", async (t) => {
   mock.timers.enable({ apis: ["setTimeout"] })
   t.after(() => mock.timers.reset())
@@ -577,9 +626,41 @@ test("hook failures are logged cut to 200 characters with a few stack frames", a
   await p.prompt("s1")
   const lines = logText().split("\n").filter(Boolean)
   assert.ok(lines.every((l) => l.length < 400))
-  assert.match(lines[0] ?? "", /prompt hook failed s1: server said x{188}$/)
+  assert.match(lines[0] ?? "", /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z prompt hook failed s1: server said x{188}$/)
   assert.ok(lines.length >= 2 && lines.length <= 4, "the failure and at least one, at most three, frames")
-  assert.ok(lines.slice(1).every((l) => /^ {4}at /.test(l)))
+  assert.ok(lines.slice(1).every((l) => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z {5}at /.test(l)))
+})
+
+test("every log line is timestamped and redacted, so a message cannot forge an entry or leak a key", async () => {
+  const secret = "sk-abcDEF123456"
+  const p = await start({
+    sessions: { s1: {} },
+    switchModel: async () => {
+      throw new Error(`switch down\nforged entry ${secret}`)
+    },
+  })
+  await p.prompt("s1")
+  const log = logText()
+  assert.ok(!log.includes(secret), "the key never reaches the log")
+  assert.match(log, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z forged entry sk-\*\*\*$/m, "the forged line has a timestamp of its own")
+  for (const line of log.split("\n").filter(Boolean)) {
+    assert.match(line, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z /, line)
+  }
+})
+
+test("a cooldown reason is redacted before it reaches state.json", async () => {
+  const secret = "sk-abcDEF123456"
+  const p = await start({ sessions: { s1: {} } })
+  await p.prompt("s1")
+  await p.emit("session.execution.started", "s1")
+  await p.retry("s1", { type: "provider.rate-limit", message: `slow down ${secret}`, status: 429 })
+  const reasons = Object.values(readState().cooldowns).map((c) => c.reason)
+  assert.ok(reasons.length > 0)
+  for (const reason of reasons) {
+    assert.ok(!reason?.includes(secret), "the key never reaches state.json")
+    assert.match(reason ?? "", /sk-\*\*\*/)
+  }
+  assert.ok(!fs.readFileSync(file("state.json"), "utf8").includes(secret))
 })
 
 test("failovers stop at maxSwitchesPerTurn and when nothing else is left; a new execution gets a new budget", async () => {
@@ -662,7 +743,7 @@ test("model list, switch and metadata failures are logged, never thrown", async 
     },
   })
   await p.prompt("s2")
-  assert.match(logText(), /prompt hook failed s2: switch down\n {4}at /)
+  assert.match(logText(), /prompt hook failed s2: switch down\n\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z {5}at /)
   await p.prompt("s1")
   assert.equal(await p.retry("s2", { model: FREE_AUTO }).then(() => "returned"), "returned")
   assert.match(logText(), /retry hook failed s2: switch down\n/)
@@ -718,7 +799,23 @@ test("cleanup stops the event stream and disposes both hooks", async () => {
 test("a stale ranking is refreshed in the background, one run at a time", async (t) => {
   const bin = file("bin")
   fs.mkdirSync(bin)
-  const runtime = (name: string) => fs.writeFileSync(path.join(bin, name), `#!/bin/sh\necho "${name} $*" > "$FREE_ROUTER_DIR/spawned"\n`, { mode: 0o755 })
+  const WINDOWS = process.platform === "win32"
+  const runtimeFile = (name: string) => path.join(bin, WINDOWS ? `${name}.cmd` : name)
+  const runtime = (name: string) => {
+    if (WINDOWS) {
+      fs.writeFileSync(
+        runtimeFile(name),
+        `@echo off\r\n"${process.execPath}" "%~dp0runtime-fake.mjs" ${name} %*\r\nexit /b %errorlevel%\r\n`,
+        "ascii",
+      )
+    } else {
+      fs.writeFileSync(runtimeFile(name), `#!/bin/sh\necho "${name} $*" > "$FREE_ROUTER_DIR/spawned"\n`, { mode: 0o755 })
+    }
+  }
+  fs.writeFileSync(
+    path.join(bin, "runtime-fake.mjs"),
+    `import fs from "node:fs"\nimport path from "node:path"\nfs.writeFileSync(path.join(process.env.FREE_ROUTER_DIR, "spawned"), process.argv.slice(2).join(" ") + "\\n")\n`,
+  )
   const savedPath = process.env.PATH
   process.env.PATH = `${path.join(DIR, "nowhere")}${path.delimiter}${bin}`
   t.after(() => {
@@ -744,7 +841,7 @@ test("a stale ranking is refreshed in the background, one run at a time", async 
 
   await start()
   assert.equal(refreshes(), 1)
-  assert.equal(fs.statSync(file("router.log")).mode & 0o777, 0o600, "a log the refresh created is private")
+  assertPrivate("router.log")
   assert.equal(fs.readFileSync(lock, "utf8"), String(process.pid))
   await until(() => spawned().endsWith("\n"), "rank.mts spawn")
   assert.equal(spawned(), `node ${file("rank.mts")} --quiet --lock ${lock}\n`)
@@ -753,7 +850,7 @@ test("a stale ranking is refreshed in the background, one run at a time", async 
   assert.equal(refreshes(), 1, "a live lock blocks a second run")
 
   fs.rmSync(file("spawned"))
-  fs.rmSync(path.join(bin, "node"))
+  fs.rmSync(runtimeFile("node"))
   runtime("bun")
   const old = new Date(Date.now() - 11 * 60e3)
   fs.utimesSync(lock, old, old)
@@ -763,7 +860,7 @@ test("a stale ranking is refreshed in the background, one run at a time", async 
   await until(() => spawned().endsWith("\n"), "bun spawn")
   assert.match(spawned(), /^bun /)
 
-  fs.rmSync(path.join(bin, "bun"))
+  fs.rmSync(runtimeFile("bun"))
   fs.rmSync(lock)
   await start()
   assert.equal(fs.existsSync(lock), false, "lock released when there is nothing to run rank.mts with")
@@ -779,15 +876,15 @@ test("a log from an older install is made private, at startup and when it rotate
   fs.writeFileSync(file("router.log"), "old\n")
   fs.chmodSync(file("router.log"), 0o644)
   await start()
-  assert.equal(fs.statSync(file("router.log")).mode & 0o777, 0o600)
+  assertPrivate("router.log")
 
   fs.writeFileSync(file("router.log"), "x".repeat((1 << 20) + 1))
   fs.chmodSync(file("router.log"), 0o644)
   const p = await start({ models: [], sessions: { s1: {} } })
   fs.chmodSync(file("router.log"), 0o644)
   await p.prompt("s1")
-  assert.equal(fs.statSync(file("router.log.1")).mode & 0o777, 0o600, "the rotated copy")
-  assert.equal(fs.statSync(file("router.log")).mode & 0o777, 0o600)
+  assertPrivate("router.log.1")
+  assertPrivate("router.log")
 })
 
 test("the log rotates past 1 MiB and a broken log never breaks the plugin", async () => {

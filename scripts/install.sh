@@ -64,7 +64,12 @@ mkdir -p "$dir/plugin"
 cp "$repo/src/plugin/index.ts" "$dir/plugin/index.ts"
 cp "$repo/src/lib.mts" "$repo/src/paths.mts" "$repo/src/rank.mts" "$dir/"
 rm -f "$dir/plugin.ts" "$dir/plugin.js" "$dir/lib.mjs" "$dir/rank.mjs"
-sed "s|@FREE_ROUTER_DIR@|$dir|" "$repo/bin/opencode-free" >"$dir/opencode-free"
+# The install directory is written into a double-quoted shell assignment, then through sed.
+# Escape both layers so a path with \, ", $, `, & or | is copied literally instead of expanded
+# or treated as part of the substitution.
+shell_dir=$(printf '%s\n' "$dir" | sed 's/[\\"$`]/\\&/g')
+sed_dir=$(printf '%s\n' "$shell_dir" | sed 's/[\\&|]/\\&/g')
+sed "s|@FREE_ROUTER_DIR@|$sed_dir|" "$repo/bin/opencode-free" >"$dir/opencode-free"
 chmod 755 "$dir/opencode-free"
 # The Windows launcher: the same rules in Node, so cmd and PowerShell need no POSIX shell. It loads
 # providers.env itself, which is why the .cmd/.ps1 shims below stay one line each.
