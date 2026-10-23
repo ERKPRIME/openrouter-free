@@ -164,7 +164,9 @@ function parseModelList(out: string) {
 
 // `raw`: every model entry opencode listed, credentials stripped, kept for debugging eligibility.
 function candidates(): { raw: unknown[]; models: ModelInfo[] } {
-  const r = spawnSync("opencode", ["api", "--standalone", "model.list"], {
+  const cmd = process.platform === "win32" ? "cmd" : "opencode";
+  const args = process.platform === "win32" ? ["/c", "opencode.cmd", "api", "--standalone", "model.list"] : ["api", "--standalone", "model.list"];
+  const r = spawnSync(cmd, args, {
     // FREE_ROUTER_RANKING stops the plugin (loaded by this opencode) from starting another ranking.
     env: { ...process.env, OPENCODE_CONFIG: CONFIG_FILE, FREE_ROUTER_DIR: DIR, FREE_ROUTER_RANKING: "1" },
     encoding: "utf8",

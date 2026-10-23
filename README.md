@@ -27,7 +27,7 @@ $ opencode-free run "explain this repo"
 ## Install
 
 Requires **opencode 2** (`opencode --version` says 2.x; `install.sh` refuses 1.x) and Node 22.18+
-(or Bun), on macOS or Linux. The code is TypeScript and ships as source: opencode loads the plugin
+(or Bun), on macOS, Linux, or Windows. On Windows, run `./scripts/install.sh` from Git Bash. The code is TypeScript and ships as source: opencode loads the plugin
 directly, and Node 22.18+ or Bun runs the ranker without a build step.
 
 If you upgrade opencode from 1.x to 2, run `./scripts/install.sh` again: the 1.x plugin does not load
