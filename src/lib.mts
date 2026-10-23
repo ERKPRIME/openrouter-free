@@ -1,11 +1,12 @@
 // Pure helpers shared by rank.mts (node) and plugin/index.ts (opencode/bun). No dependencies.
 import fs from "node:fs"
 import path from "node:path"
-import { fileURLToPath } from "node:url"
+import { DATA_DIR } from "./paths.mts"
 
-// The install directory is wherever these files live (install.sh copies them there);
-// FREE_ROUTER_DIR overrides it, e.g. for an isolated test copy.
-export const DIR = process.env.FREE_ROUTER_DIR || path.dirname(fileURLToPath(import.meta.url))
+// free.jsonc, config.json, pins.json, keys, ranking.json and state.json all live here. paths.mts
+// resolves it: FREE_ROUTER_DIR, else the directory next to this file for an install.sh install, else
+// the platform's user config directory. The code can live elsewhere (an npm package).
+export const DIR = DATA_DIR
 
 export interface ModelRef {
   providerID: string
