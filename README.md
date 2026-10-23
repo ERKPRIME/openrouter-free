@@ -5,7 +5,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/openrouter-free.svg)](https://www.npmjs.com/package/openrouter-free)
 [![Coverage Status](https://coveralls.io/repos/github/ERKPRIME/openrouter-free/badge.svg?branch=master)](https://coveralls.io/github/ERKPRIME/openrouter-free?branch=master)
 
-> **Install now:** `npm install -g openrouter-free` — run `openrouter-free` from any directory. [View on npm](https://www.npmjs.com/package/openrouter-free).
+> **Recommended:** `npm install -g openrouter-free` then run `openrouter-free` from any directory. [View on npm](https://www.npmjs.com/package/openrouter-free)
 
 An [opencode](https://opencode.ai) plugin that always runs on the **best free model available right
 now**, so you never have to track which free models exist this week.
@@ -26,14 +26,17 @@ You pick one model, `free/auto`, and the plugin does the rest:
   provider data. Subscription plans that report a price of 0 are never used.
 
 ```text
-$ opencode-free run "explain this repo"
+$ npm install -g openrouter-free
+$ openrouter-free run "explain this repo"
 > build · space-bunny-free
 ```
 
 This repository is the Windows-native adaptation of
 [lettland/opencode-free-router](https://github.com/lettland/opencode-free-router). It keeps the
 original Linux/macOS behavior and adds first-class native Windows support. Read the
-[Spanish README](README.es.md).
+[Spanish README](README.es.md). Published on npm as [`openrouter-free`](https://www.npmjs.com/package/openrouter-free).
+
+**Quick start (npm):** `npm install -g openrouter-free && openrouter-free`
 
 Requires **opencode 2** (`opencode --version` says 2.x) and Node 22.18+ (or Bun), on macOS, Linux or
 Windows. The code is TypeScript and ships as source: opencode loads the plugin directly, and Node
