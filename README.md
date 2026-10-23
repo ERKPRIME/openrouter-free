@@ -1,7 +1,7 @@
 # opencode-free-router
 
-[![ci](https://github.com/lettland/opencode-free-router/actions/workflows/ci.yml/badge.svg)](https://github.com/lettland/opencode-free-router/actions/workflows/ci.yml)
-[![Coverage Status](https://coveralls.io/repos/github/lettland/opencode-free-router/badge.svg?branch=master)](https://coveralls.io/github/lettland/opencode-free-router?branch=master)
+[![ci](https://github.com/ERKPRIME/openrouter-free/actions/workflows/ci.yml/badge.svg)](https://github.com/ERKPRIME/openrouter-free/actions/workflows/ci.yml)
+[![Coverage Status](https://coveralls.io/repos/github/ERKPRIME/openrouter-free/badge.svg?branch=master)](https://coveralls.io/github/ERKPRIME/openrouter-free?branch=master)
 
 An [opencode](https://opencode.ai) plugin that always runs on the **best free model available right
 now**, so you never have to track which free models exist this week.
@@ -26,46 +26,99 @@ $ opencode-free run "explain this repo"
 
 ## Install
 
-Requires **opencode 2** (`opencode --version` says 2.x; `install.sh` refuses 1.x) and Node 22.18+
-(or Bun), on macOS, Linux, or Windows. On Windows, run `./scripts/install.sh` from Git Bash. The code is TypeScript and ships as source: opencode loads the plugin
-directly, and Node 22.18+ or Bun runs the ranker without a build step.
+Requires **opencode 2** (`opencode --version` says 2.x) and Node 22.18+ (or Bun), on macOS, Linux or
+Windows. The code is TypeScript and ships as source: opencode loads the plugin directly, and Node
+22.18+ or Bun runs the ranker without a build step.
 
-If you upgrade opencode from 1.x to 2, run `./scripts/install.sh` again: the 1.x plugin does not load
-on 2, and the script moves the `plugin` entry of your `free.jsonc` to the `plugins` entry opencode 2
-reads.
+If you upgrade opencode from 1.x to 2, run the installer again: the 1.x plugin does not load on 2, and
+it moves the `plugin` entry of your `free.jsonc` to the `plugins` entry opencode 2 reads.
+
+### npm (recommended)
 
 ```sh
-git clone https://github.com/lettland/opencode-free-router
-cd opencode-free-router
+npm install -g openrouter-free
+openrouter-free
+```
+
+The first run creates the data directory, ranks the free models and opens the TUI. Nothing is written
+inside `node_modules`: the CLI mirrors the code it runs into your data directory, because Node refuses
+to strip types under `node_modules` and `rank.mts` is TypeScript.
+
+On Windows, `npm install -g` works from PowerShell or Command Prompt and installs an
+`openrouter-free.cmd` shim next to your global `node`. If the command is not found afterwards, the npm
+global bin directory is not on `PATH`; `npm config get prefix` prints it.
+
+Data lives in:
+
+| Platform | Directory |
+|---|---|
+| Windows | `%APPDATA%\openrouter-free` |
+| macOS | `~/Library/Application Support/openrouter-free` |
+| Linux | `$XDG_CONFIG_HOME/openrouter-free`, else `~/.config/openrouter-free` |
+
+Set `FREE_ROUTER_DIR` to use another directory. Provider keys go in `providers.env` there (optional:
+keys you already have via `opencode auth login` work without it).
+
+### From a checkout (`scripts/install.sh`)
+
+The shell installer keeps everything, code included, in one directory: `~/.config/opencode/free-router`
+(or `$XDG_CONFIG_HOME/…`, or `--dir PATH`). It runs the first ranking and links `opencode-free` into
+`~/.local/bin` if that is on your `PATH`. Re-run it to upgrade. Your config, pins, keys and state are
+never overwritten. It is a separate install from the npm package; use `FREE_ROUTER_DIR` to share one
+data directory between them.
+
+#### Windows (Command Prompt or PowerShell)
+
+```bat
+git clone https://github.com/ERKPRIME/openrouter-free.git
+cd openrouter-free
+install.cmd          # add --bb to also register a bb agent
+```
+
+```powershell
+git clone https://github.com/ERKPRIME/openrouter-free.git
+cd openrouter-free
+.\install.ps1        # add -Bb to also register a bb agent
+```
+
+`install.cmd` and `install.ps1` only locate Git Bash and run `scripts/install.sh`; Git for Windows
+ships one. If it is not found, run `scripts/install.sh` yourself with any POSIX shell (Git Bash, WSL).
+On Windows the installer also writes `opencode-free.cmd` and `opencode-free.ps1` next to the POSIX
+`opencode-free`, so the launcher works from Command Prompt and PowerShell without Git Bash.
+
+#### macOS, Linux, Git Bash, or WSL
+
+```sh
+git clone https://github.com/ERKPRIME/openrouter-free.git
+cd openrouter-free
 ./scripts/install.sh          # add --bb to also register a bb agent
 ```
 
 To pin a release instead of tracking `master`, `git checkout vX.Y.Z` (see
-[releases](https://github.com/lettland/opencode-free-router/releases)) before running it.
+[releases](https://github.com/ERKPRIME/openrouter-free/releases)) before running it.
 
-This installs into `~/.config/opencode/free-router` (or `$XDG_CONFIG_HOME/…`, or `--dir PATH`), runs
-the first ranking, and links `opencode-free` into `~/.local/bin` if that is on your `PATH`. Re-run it
-to upgrade. Your config, pins, keys and state are never overwritten.
-
-Then:
+### Running it
 
 ```sh
-opencode-free                 # TUI on free/auto
-opencode-free run "..."       # one-shot
-opencode-free acp             # ACP agent (Zed, JetBrains, bb, ...)
+openrouter-free                # npm: TUI on free/auto
+opencode-free                  # install.sh: the same launcher
+openrouter-free run "..."      # one-shot
+openrouter-free acp            # ACP agent (Zed, JetBrains, bb, ...)
+openrouter-free doctor         # versions, paths, what is missing
+openrouter-free rank --status  # ranking, cooldowns, model per session
 ```
 
-`opencode-free` is plain `opencode` with the free-router config layered on top via `OPENCODE_CONFIG`.
-Your normal `opencode` is unaffected. opencode 2 commands normally talk to a shared background
-service that ignores that variable, so the wrapper runs each of them with its own private server
-(`--standalone`). Three consequences: `opencode-free service` (and `serve --service`) is refused;
-so are the commands that manage, restart or may auto-start that service (`debug`, `pair`, `mcp`,
-`plugin`, `upgrade`, `update`, `uninstall`), because it could come up with the free-router config and
-your provider keys, so run those as plain `opencode`; and a `run` message has to be quoted, because
-an unquoted word `service` in it is refused too:
+`openrouter-free` is the same as `opencode-free`, and both are plain `opencode` with the free-router
+config layered on top via `OPENCODE_CONFIG`. Your normal `opencode` is unaffected. opencode 2 commands
+normally talk to a shared background service that ignores that variable, so the wrapper runs each of
+them with its own private server (`--standalone`). Three consequences: `openrouter-free service` (and
+`serve --service`) is refused; so are the commands that manage, restart or may auto-start that service
+(`debug`, `pair`, `mcp`, `plugin`, `upgrade`, `update`, `uninstall`), because it could come up with the
+free-router config and your provider keys, so run those as plain `opencode`; and a `run` message has to
+be quoted, because an unquoted word `service` in it is refused too:
 
 ```sh
-opencode-free run "restart the service"    # not: opencode-free run restart the service
+openrouter-free run "restart the service"    # not: openrouter-free run restart the service
 ```
 
 ## Which free models
@@ -133,7 +186,10 @@ than `refreshHours` (6).
    benchmarked model.
 
 ```sh
-node ~/.config/opencode/free-router/rank.mts --status    # ranking, cooldowns, model per session
+node %APPDATA%\openrouter-free\rank.mts --status    # npm on Windows
+node ~/.config/openrouter-free/rank.mts --status   # npm on Linux
+node "$HOME/Library/Application Support/openrouter-free/rank.mts" --status  # npm on macOS
+node ~/.config/opencode/free-router/rank.mts --status  # scripts/install.sh
 ```
 
 ### Overrides: `pins.json`
@@ -197,11 +253,10 @@ the router leaves the session and its errors alone; `/model free/auto` hands it 
 ## bb
 
 `./scripts/install.sh --bb` registers a custom ACP agent **Free (auto)** (provider `acp-free`) that
-runs `opencode-free acp`. Pick `free/auto` as its model. No other bb agent is touched. If an
-older install shows only "Agent default" as the model, re-run `./scripts/install.sh --bb`.
-
-A failover happens inside the running prompt, so bb sees one prompt answered by the new model; it
-no longer receives a queued "continue" message.
+runs `openrouter-free acp` (npm) or `opencode-free acp` (scripts install). Pick `free/auto` as its model.
+No other bb agent is touched. If an older install shows only "Agent default" as the model, re-run the
+installer with `--bb`. A failover happens inside the running prompt, so bb sees one prompt answered by
+the new model; it no longer receives a queued "continue" message.
 
 ## Privacy
 
@@ -223,7 +278,8 @@ Don't point `free/auto` at confidential or client code. To narrow the pool, `ban
 ## Troubleshooting
 
 - `rank.mts --status` shows the ranking, warnings, active cooldowns, and which model each session uses.
-- `router.log` in the install directory records picks, failovers and background refreshes.
+- `router.log` in the data directory records picks, failovers and background refreshes (see "Install" for
+  where it lives).
 - `cache/candidates.json` holds what opencode reported for each model (without headers, request
   bodies and provider settings), which explains why a model was or wasn't eligible.
 
@@ -238,21 +294,34 @@ npm run lint:sh               # shellcheck
 ./scripts/e2e-failover.sh     # real opencode 2 + a fake 429 provider: failover, stickiness, fail-fast
 ```
 
-Every push to `master` that changes shipped code (`src`, `bin`, `templates`, the install scripts,
-`package.json`) is tagged and released automatically. Write entries under `## Unreleased` in
-[CHANGELOG.md](CHANGELOG.md); a `[minor]` or `[major]` marker in a commit subject picks the bump,
-otherwise it is a patch.
+## Update and uninstall
 
-## Uninstall
+### npm
+```sh
+npm update -g openrouter-free        # update to the latest published version
+npm uninstall -g openrouter-free     # remove the global command
+```
+Your data in `%APPDATA%\openrouter-free` (Windows), `~/Library/Application Support/openrouter-free`
+(macOS) or `~/.config/openrouter-free` (Linux) is not removed by `npm uninstall`; delete it manually
+if you want to purge everything. `FREE_ROUTER_DIR` can point it somewhere else.
 
+### From a checkout
 ```sh
 ./scripts/uninstall.sh [--bb] [--purge]
 ```
-
 This removes the code and the wrapper (and the bb agent with `--bb`). Your config, keys and state stay
 unless you pass `--purge`.
 
+## Publishing (manual)
+```sh
+npm login
+npm publish
+```
+Publish only when authorized; this project does not publish automatically. Check `npm pack --dry-run`
+and test the `.tgz` before publishing. Update the version in `package.json` and `CHANGELOG.md` first.
+
 ## Attribution
+
 
 Model scores come from [LMArena](https://lmarena.ai) (`lmarena-ai/leaderboard-dataset`) and
 [Artificial Analysis](https://artificialanalysis.ai). Not affiliated with either, or with opencode.

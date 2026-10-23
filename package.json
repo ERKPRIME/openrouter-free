@@ -1,26 +1,39 @@
 {
-  "name": "opencode-free-router",
-  "version": "0.1.3",
-  "description": "opencode plugin: always run on the best free model available, ranked by LMArena and Artificial Analysis, sticky per session, with automatic failover.",
-  "private": true,
+  "name": "openrouter-free",
+  "version": "0.2.0",
+  "description": "opencode with the free-router config: always run on the best free model available, ranked by LMArena and Artificial Analysis, sticky per session, with automatic failover.",
   "type": "module",
   "license": "BSD-2-Clause",
-  "homepage": "https://github.com/lettland/opencode-free-router#readme",
+  "homepage": "https://github.com/ERKPRIME/openrouter-free#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lettland/opencode-free-router.git"
+    "url": "git+https://github.com/ERKPRIME/openrouter-free.git"
   },
   "bugs": {
-    "url": "https://github.com/lettland/opencode-free-router/issues"
+    "url": "https://github.com/ERKPRIME/openrouter-free/issues"
   },
   "keywords": [
     "opencode",
     "opencode-plugin",
+    "opencode-cli",
     "free-models",
     "llm-router",
     "lmarena",
     "openrouter",
     "bb"
+  ],
+  "bin": {
+    "openrouter-free": "bin/openrouter-free.mjs"
+  },
+  "files": [
+    "bin/openrouter-free.mjs",
+    "src/lib.mts",
+    "src/paths.mts",
+    "src/rank.mts",
+    "src/plugin/index.ts",
+    "templates/",
+    "CHANGELOG.md",
+    "SECURITY.md"
   ],
   "engines": {
     "node": ">=22.18"
@@ -30,7 +43,9 @@
     "test:coverage": "mkdir -p coverage && node --test --experimental-test-coverage --test-coverage-include='src/**' --test-coverage-include-all --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/lcov.info test/*.test.ts",
     "check": "tsc",
     "lint:sh": "shellcheck scripts/*.sh bin/opencode-free",
-    "e2e": "./scripts/e2e-failover.sh"
+    "e2e": "./scripts/e2e-failover.sh",
+    "prepack": "npm run check",
+    "pack:check": "npm pack --dry-run"
   },
   "devDependencies": {
     "@opencode/plugin": "2.0.32",

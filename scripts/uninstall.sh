@@ -42,13 +42,14 @@ fi
 
 link="$HOME/.local/bin/opencode-free"
 if [ -L "$link" ] && [ "$(readlink "$link")" = "$dir/opencode-free" ]; then rm -f "$link"; fi
+rm -f "$HOME/.local/bin/opencode-free.cmd" "$HOME/.local/bin/opencode-free.ps1"
 
 if [ "$purge" = 1 ]; then
   rm -rf "$dir"
   echo "removed $dir"
 else
   # plugin.ts and the .js/.mjs names are what installs from before opencode 2 and the TypeScript port have.
-  rm -f "$dir/plugin/index.ts" "$dir/lib.mts" "$dir/rank.mts" "$dir/plugin.ts" "$dir/plugin.js" "$dir/lib.mjs" "$dir/rank.mjs" "$dir/opencode-free" "$dir/rank.lock"
+  rm -f "$dir/plugin/index.ts" "$dir/lib.mts" "$dir/paths.mts" "$dir/rank.mts" "$dir/plugin.ts" "$dir/plugin.js" "$dir/lib.mjs" "$dir/rank.mjs" "$dir/opencode-free" "$dir/opencode-free.mjs" "$dir/opencode-free.cmd" "$dir/opencode-free.ps1" "$dir/rank.lock"
   # No recursive remove: a plugin directory the user added files to stays.
   rmdir "$dir/plugin" 2>/dev/null || true
   echo "removed code from $dir; kept free.jsonc, config.json, pins.json, *.env, ranking and state (use --purge to delete them)"
