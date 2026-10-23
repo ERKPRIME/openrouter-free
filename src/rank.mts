@@ -218,15 +218,9 @@ function parseModelList(out: string) {
 
 // `raw`: every model entry opencode listed, credentials stripped, kept for debugging eligibility.
 function candidates(): { raw: unknown[]; models: ModelInfo[] } {
-  // npm installs opencode as opencode.cmd on Windows, which CreateProcess cannot run directly.
-  // Resolve the real file first and use cmd.exe only for a .cmd/.bat shim; the arguments below are
-  // constants, never user text, so nothing is interpolated into a shell.
-  const executable = findExecutable("opencode")
-  const env: NodeJS.ProcessEnv = { ...process.env, OPENCODE_CONFIG: CONFIG_FILE, FREE_ROUTER_DIR: DIR, FREE_ROUTER_RANKING: "1" }
-  // ranker.env is for this process only. If a user also put the key in providers.env, keep it out of
-  // the opencode child; that child passes its environment on to provider plugins and tools.
-  delete env.ARTIFICIAL_ANALYSIS_API_KEY
-  const options = {
+  const cmd = process.platform === "win32" ? "cmd" : "opencode";
+  const args = process.platform === "win32" ? ["/c", "opencode.cmd", "api", "--standalone", "model.list"] : ["api", "--standalone", "model.list"];
+  const r = spawnSync(cmd, args, {
     // FREE_ROUTER_RANKING stops the plugin (loaded by this opencode) from starting another ranking.
     env,
     encoding: "utf8" as const,

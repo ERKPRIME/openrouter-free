@@ -31,7 +31,9 @@ This repository is the Windows-native adaptation of
 original Linux/macOS behavior and adds first-class native Windows support. Read the
 [Spanish README](README.es.md).
 
-## Requirements
+Requires **opencode 2** (`opencode --version` says 2.x; `install.sh` refuses 1.x) and Node 22.18+
+(or Bun), on macOS, Linux, or Windows. On Windows, run `./scripts/install.sh` from Git Bash. The code is TypeScript and ships as source: opencode loads the plugin
+directly, and Node 22.18+ or Bun runs the ranker without a build step.
 
 - **opencode 2** (`opencode --version` says 2.x). The installers refuse opencode 1.x.
 - **Node.js 22.18 or newer** (or Bun on POSIX). The code ships as TypeScript source: opencode loads
