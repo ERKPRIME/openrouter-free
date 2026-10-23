@@ -3,8 +3,10 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
-import { asArray, asObject, tokens, fit, bestMatch, percentiles, score, isFree, isEligible, key, looksSmall, classifyFailure, pick, orderCandidates, mergeState, mergeConfig, readJSON, writeJSONAtomic, loadConfig, loadPins, coolingUntil, split, decodeModel, decodeState, rankedIds, DEFAULT_CONFIG as cfg } from "../src/lib.mts"
+import { assertPrivateAcl } from "./fixtures/acl.ts"
+import { asArray, asObject, tokens, fit, bestMatch, percentiles, score, isFree, isEligible, key, looksSmall, classifyFailure, pick, orderCandidates, mergeState, mergeConfig, readJSON, writeJSONAtomic, loadConfig, loadPins, coolingUntil, split, decodeModel, decodeState, rankedIds, findExecutable, needsCommandShell, windowsCommandLine, redactSecrets, DEFAULT_CONFIG as cfg } from "../src/lib.mts"
 import type { FailureDecision, FailureInfo, ModelInfo, Pins } from "../src/lib.mts"
 
 test("config merge keeps nested defaults", () => {
@@ -273,6 +275,11 @@ test("pick and order", () => {
   const live = [model("opencode", "undated-free"), model("opencode", "new-free", { release_date: "2026-09-24" }), model("opencode", "old-free", { release_date: "2026-01-01" }), model("openai", "paid", { cost: { input: 1, output: 1 } })]
   const ranking = { models: [{ id: "opencode/old-free" }, { id: "openai/paid" }, { id: "opencode/gone-free" }, { score: 1 }] }
   assert.deepEqual(orderCandidates(rankedIds(ranking), live, cfg, pins), ["opencode/old-free", "opencode/new-free", "opencode/undated-free"], "stale ranking cannot route to paid or vanished models; unranked ones follow, newest first")
+  assert.deepEqual(
+    orderCandidates(["opencode/old-free", "opencode/old-free", "opencode/new-free", "opencode/new-free"], live, cfg, pins),
+    ["opencode/old-free", "opencode/new-free", "opencode/undated-free"],
+    "a repeated ranking id is still one candidate; live unranked models follow",
+  )
 })
 
 test("state merge keeps later cooldowns and prunes", () => {
@@ -309,9 +316,108 @@ test("config and pins files", () => {
     assert.equal(loadConfig(dir).cooldownMinutes.quota, 360)
     writeJSONAtomic(path.join(dir, "pins.json"), { ban: ["x/y", 1], alias: { "a/b": "b", "c/d": 2 } })
     assert.deepEqual(loadPins(dir), { pin: [], ban: ["x/y"], alias: { "a/b": "b" } }, "malformed entries are dropped")
-    assert.equal(fs.statSync(path.join(dir, "pins.json")).mode & 0o777, 0o600, "state files are private")
+    const pins = path.join(dir, "pins.json")
+    if (process.platform === "win32") {
+      // Windows ignores mode bits for privacy; the file inherits the profile ACL. Check the real
+      // DACL (by SID) rather than pretending 0600 means anything there.
+      assertPrivateAcl(pins, "pins.json")
+    } else {
+      assert.equal(fs.statSync(pins).mode & 0o777, 0o600, "state files are private")
+    }
     assert.deepEqual(fs.readdirSync(dir).sort(), ["config.json", "pins.json"], "no temp files left behind")
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("redactSecrets removes common credential shapes and keeps ordinary words", () => {
+  assert.equal(redactSecrets("failed with sk-abcDEF123456"), "failed with sk-***")
+  assert.equal(redactSecrets("xoxb-1234567890-abcdef"), "xox*-***")
+  assert.equal(redactSecrets("Bearer eyJhbGciOi.abc"), "Bearer ***")
+  assert.equal(redactSecrets("api_key=super-secret"), "api_key=***")
+  assert.equal(redactSecrets("access_token: abc123"), "access_token: ***")
+  assert.equal(redactSecrets('client_secret: "a b"'), "client_secret: ***")
+  assert.equal(redactSecrets("password = hunter2"), "password = ***")
+  assert.equal(redactSecrets("secret: super"), "secret: ***")
+  assert.match(redactSecrets("https://x.test/v1?token=abc&x=1"), /^https:\/\/x\.test\/v1\?token=\*\*\*/)
+  assert.equal(redactSecrets("token budget stays"), "token budget stays", "a word that merely looks like a key is left alone")
+  assert.equal(redactSecrets("100% not a key"), "100% not a key")
+  assert.equal(redactSecrets("sk-short"), "sk-short")
+})
+
+test("writeJSONAtomic removes its temporary file when the rename fails", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "free-router-atomic-"))
+  try {
+    const target = path.join(dir, "state.json")
+    fs.mkdirSync(target)
+    assert.throws(() => writeJSONAtomic(target, { ok: true }))
+    assert.deepEqual(fs.readdirSync(dir), ["state.json"], "a failed write leaves no .tmp file")
+    assert.ok(fs.statSync(target).isDirectory(), "and does not replace what was there")
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
+test("executable lookup follows PATHEXT on Windows and bare names on POSIX", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "free-router-exe-"))
+  try {
+    const node = path.join(dir, "node.EXE")
+    fs.writeFileSync(node, "")
+    fs.chmodSync(node, 0o755)
+    assert.equal(findExecutable("node", dir, "win32"), node)
+    assert.equal(findExecutable("node", `"${dir}"`, "win32"), node, "a quoted PATH entry is unwrapped")
+    assert.equal(findExecutable("node", `${path.join(dir, "nowhere")}${path.delimiter}${dir}`, "win32"), node)
+    assert.equal(findExecutable("missing", dir, "win32"), undefined)
+
+    fs.mkdirSync(path.join(dir, "folder.exe"))
+    assert.equal(findExecutable("folder", dir, "win32"), undefined, "a directory is not executable on Windows")
+
+    const bare = path.join(dir, "opencode")
+    fs.writeFileSync(bare, "")
+    fs.chmodSync(bare, 0o755)
+    assert.equal(findExecutable("opencode", dir, "linux"), bare)
+    assert.equal(findExecutable("opencode", dir, "win32"), undefined, "no extension on Windows")
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("cmd.exe command lines quote every word and only wrap .cmd/.bat", () => {
+  assert.equal(needsCommandShell("C:\\tools\\opencode.cmd", "win32"), true)
+  assert.equal(needsCommandShell("C:\\tools\\opencode.BAT", "win32"), true)
+  assert.equal(needsCommandShell("C:\\tools\\opencode.exe", "win32"), false)
+  assert.equal(needsCommandShell("/usr/bin/opencode", "linux"), false)
+
+  assert.equal(
+    windowsCommandLine("C:\\Program Files\\opencode.cmd", ["api", "model.list"]),
+    '"C:\\Program Files\\opencode.cmd" "api" "model.list"',
+  )
+  assert.equal(windowsCommandLine("C:\\x\\opencode.cmd", ['a"b']), '"C:\\x\\opencode.cmd" "a""b"')
+  assert.equal(windowsCommandLine("C:\\x\\opencode.cmd", ["C:\\trailing\\"]), '"C:\\x\\opencode.cmd" "C:\\trailing\\\\"')
+  assert.equal(windowsCommandLine("C:\\x\\opencode.cmd", ["100%"]), '"C:\\x\\opencode.cmd" "100%"')
+  assert.equal(windowsCommandLine("C:\\x\\opencode.cmd", ["a&b|c<d>e(f)g^h!i"]), '"C:\\x\\opencode.cmd" "a&b|c<d>e(f)g^h!i"')
+})
+
+test("cmd.exe passes quoted words through to a real .cmd shim", { skip: process.platform === "win32" ? false : "cmd.exe is Windows-only" }, (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "free-router-cmd-"))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const out = path.join(dir, "arg.txt")
+  fs.writeFileSync(
+    path.join(dir, "capture.mjs"),
+    `import fs from "node:fs"\nfs.writeFileSync(process.env.OUT, process.argv.slice(2).join("\\n"))\n`,
+  )
+  fs.writeFileSync(path.join(dir, "capture.cmd"), `@echo off\r\n"${process.execPath}" "%~dp0capture.mjs" %*\r\n`, "ascii")
+
+  const arg = 'a"b&c|d<e>f(g)h^i!j'
+  for (const value of [arg, "C:\\trailing\\", ""]) {
+    const line = windowsCommandLine(path.join(dir, "capture.cmd"), [value])
+    const r = spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/v:off", "/s", "/c", `"${line}"`], {
+      encoding: "utf8",
+      windowsVerbatimArguments: true,
+      env: { ...process.env, OUT: out },
+    })
+    assert.equal(r.status, 0, r.stderr)
+    assert.equal(fs.readFileSync(out, "utf8"), value, JSON.stringify(value))
   }
 })

@@ -29,12 +29,54 @@ import {
   optNumber,
   stringList,
   errorText,
+  redactSecrets,
+  findExecutable,
+  windowsCommandLine,
+  needsCommandShell,
 } from "./lib.mts"
 import type { JsonObject, ModelInfo, RankedRow, Row, Scored, SourceHit } from "./lib.mts"
 
+const HELP = `Usage: rank.mts [options]
+
+  (no options)             refresh ranking.json and print a one-line summary
+  --status                 print ranking.json, cooldowns and recent session picks
+  --quiet                  refresh, printing only warnings
+  --config <free.jsonc>    opencode config to list models with (default: free.jsonc here)
+  --lock <file>            remove this lock file when done (set by the plugin)
+  -h, --help               show this help
+
+Ranking needs network access, opencode 2 on PATH and at least one configured provider.
+Exit codes: 0 success, 1 refresh failed, 2 invalid command line.`
+
+const argv = process.argv.slice(2)
+if (argv.includes("-h") || argv.includes("--help")) {
+  console.log(HELP)
+  process.exit(0)
+}
+const valueFlags = new Set(["--config", "--lock"])
+const knownFlags = new Set(["--status", "--quiet", "-h", "--help", "--config", "--lock"])
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i] as string
+  if (!a.startsWith("-")) {
+    console.error(`rank: unexpected argument '${a}' (see --help)`)
+    process.exit(2)
+  }
+  if (!knownFlags.has(a)) {
+    console.error(`rank: unknown option '${a}' (see --help)`)
+    process.exit(2)
+  }
+  if (valueFlags.has(a)) {
+    if (argv[i + 1] === undefined) {
+      console.error(`rank: ${a} needs a value`)
+      process.exit(2)
+    }
+    i++
+  }
+}
+
 const arg = (name: string) => {
-  const i = process.argv.indexOf(name)
-  return i > 0 ? process.argv[i + 1] : undefined
+  const i = argv.indexOf(name)
+  return i >= 0 ? argv[i + 1] : undefined
 }
 const CONFIG_FILE = path.resolve(arg("--config") ?? path.join(DIR, "free.jsonc"))
 const CACHE = path.join(DIR, "cache")
@@ -56,7 +98,8 @@ interface Ranking {
   models: Scored[]
 }
 
-function loadEnv(file: string) {
+// `target` lets ranker.env stay out of process.env: only providers.env may reach the opencode child.
+function loadEnv(file: string, target: Record<string, string | undefined> = process.env) {
   let text
   try {
     text = fs.readFileSync(file, "utf8")
@@ -66,7 +109,7 @@ function loadEnv(file: string) {
   for (const line of text.split("\n")) {
     const [, name, value] = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/) ?? []
     if (!name || !value) continue
-    process.env[name] = value.replace(/^(['"])(.*)\1$/, "$2")
+    target[name] = value.replace(/^(['"])(.*)\1$/, "$2")
   }
 }
 
@@ -81,14 +124,18 @@ async function cached<T>(name: string, ttl: number, load: () => Promise<T>, deco
   const file = path.join(CACHE, `${name}.json`)
   const prev = asObject(readJSON(file))
   const fetchedAt = optNumber(prev.fetchedAt)
-  if (fetchedAt !== undefined && Date.now() - fetchedAt < ttl) return decode(prev.data)
+  const now = Date.now()
+  // A future timestamp is a bad clock or a hand-edited cache. Treat it as stale instead of trusting
+  // it until the clock catches up.
+  const fresh = fetchedAt !== undefined && fetchedAt <= now + 5 * 60e3 && now - fetchedAt < ttl
+  if (fresh) return decode(prev.data)
   try {
     const data = await load()
     fs.mkdirSync(CACHE, { recursive: true })
     writeJSONAtomic(file, { fetchedAt: Date.now(), data })
     return data
   } catch (e) {
-    warnings.push(`${name}: ${errorText(e)}${fetchedAt !== undefined ? ` (using copy from ${new Date(fetchedAt).toISOString()})` : " (no previous copy)"}`)
+    warnings.push(`${name}: ${redactSecrets(errorText(e))}${fetchedAt !== undefined ? ` (using copy from ${new Date(fetchedAt).toISOString()})` : " (no previous copy)"}`)
     return decode(prev.data)
   }
 }
@@ -103,7 +150,9 @@ const decodeRows = (v: unknown) =>
 // Overall rows come first in every board; stop paging once another category starts.
 async function arenaBoard(config: string, field: string) {
   const rows: Row[] = []
-  for (let offset = 0; ; offset += 100) {
+  // The API normally returns a few hundred overall rows; the cap only stops a broken or malicious
+  // response that keeps claiming there are more pages.
+  for (let offset = 0; offset <= 100_000; offset += 100) {
     const d = asObject(await getJSON(`${HF}&config=${config}&offset=${offset}&length=100`))
     for (const { row } of list(d.rows, asObject)) {
       const r = asObject(row)
@@ -113,6 +162,7 @@ async function arenaBoard(config: string, field: string) {
     }
     if (offset + 100 >= (optNumber(d.num_rows_total) ?? 0)) return rows
   }
+  throw new Error(`${config}: leaderboard pagination did not end`)
 }
 
 const decodeAA = (v: unknown) =>
@@ -142,18 +192,22 @@ async function openrouterStealth() {
   })
 }
 
-// Fields of a model entry that can hold credentials (provider settings carry the API key).
-const dropSecrets = ({ headers, body, settings, ...rest }: JsonObject) => rest
+// Fields that can hold credentials. Provider settings carry the API key, and variants repeat them.
+// The search is recursive because opencode may nest a provider object inside another field.
+const SECRET_KEYS = new Set(["headers", "body", "settings", "apikey", "api_key", "authorization", "token", "secret", "password", "client_secret", "access_token", "refresh_token"])
 
-// A model entry as kept in cache/candidates.json: without anything that can carry credentials.
-function stripSecrets(model: JsonObject) {
-  const m = dropSecrets(model)
-  return isArray(m.variants) ? { ...m, variants: m.variants.map((x) => dropSecrets(asObject(x))) } : m
+function stripSecrets(value: unknown): unknown {
+  if (isArray(value)) return value.map(stripSecrets)
+  if (!isObject(value)) return value
+  const out: JsonObject = {}
+  for (const [k, v] of Object.entries(value)) if (!SECRET_KEYS.has(k.toLowerCase())) out[k] = stripSecrets(v)
+  return out
 }
 
 // opencode prints the model list as one JSON object, possibly between log lines.
 function parseModelList(out: string) {
-  for (const text of [out, ...out.split("\n"), out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1)]) {
+  const clean = out.replace(/^\uFEFF/, "")
+  for (const text of [clean, ...clean.split("\n"), clean.slice(clean.indexOf("{"), clean.lastIndexOf("}") + 1)]) {
     try {
       const data = asObject(JSON.parse(text)).data
       if (isArray(data)) return data
@@ -164,21 +218,35 @@ function parseModelList(out: string) {
 
 // `raw`: every model entry opencode listed, credentials stripped, kept for debugging eligibility.
 function candidates(): { raw: unknown[]; models: ModelInfo[] } {
-  const r = spawnSync("opencode", ["api", "--standalone", "model.list"], {
+  // npm installs opencode as opencode.cmd on Windows, which CreateProcess cannot run directly.
+  // Resolve the real file first and use cmd.exe only for a .cmd/.bat shim; the arguments below are
+  // constants, never user text, so nothing is interpolated into a shell.
+  const executable = findExecutable("opencode")
+  const env: NodeJS.ProcessEnv = { ...process.env, OPENCODE_CONFIG: CONFIG_FILE, FREE_ROUTER_DIR: DIR, FREE_ROUTER_RANKING: "1" }
+  // ranker.env is for this process only. If a user also put the key in providers.env, keep it out of
+  // the opencode child; that child passes its environment on to provider plugins and tools.
+  delete env.ARTIFICIAL_ANALYSIS_API_KEY
+  const options = {
     // FREE_ROUTER_RANKING stops the plugin (loaded by this opencode) from starting another ranking.
-    env: { ...process.env, OPENCODE_CONFIG: CONFIG_FILE, FREE_ROUTER_DIR: DIR, FREE_ROUTER_RANKING: "1" },
-    encoding: "utf8",
+    env,
+    encoding: "utf8" as const,
     timeout: 180_000,
     maxBuffer: 64 << 20,
-  })
-  if (r.status !== 0) throw new Error(`opencode model.list failed: ${(r.stderr || r.error?.message || "").slice(0, 300)}`)
+  }
+  const args = ["api", "--standalone", "model.list"]
+  const r = needsCommandShell(executable ?? "")
+    ? spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/v:off", "/s", "/c", `"${windowsCommandLine(executable as string, args)}"`], { ...options, windowsVerbatimArguments: true })
+    : spawnSync(executable ?? "opencode", args, options)
+  if (r.status !== 0) throw new Error(`opencode model.list failed: ${redactSecrets((r.stderr || r.error?.message || "").slice(0, 300))}`)
   const data = parseModelList(r.stdout)
   return { raw: list(data, (x) => (isObject(x) ? stripSecrets(x) : undefined)), models: list(data, decodeModel) }
 }
 
 async function refresh() {
   loadEnv(path.join(DIR, "providers.env"))
-  loadEnv(path.join(DIR, "ranker.env"))
+  // Never put ranker.env into process.env: candidates() spawns opencode with a copy of it.
+  const rankerEnv: Record<string, string | undefined> = {}
+  loadEnv(path.join(DIR, "ranker.env"), rankerEnv)
   const cfg = loadConfig()
   const pins = loadPins()
   const warnings: string[] = []
@@ -192,7 +260,7 @@ async function refresh() {
   for (const [src, [config, field]] of Object.entries(ARENA)) {
     boards[src] = percentiles(await cached(src, 20 * 3600e3, () => arenaBoard(config, field), decodeRows, warnings))
   }
-  const aaKey = process.env.ARTIFICIAL_ANALYSIS_API_KEY
+  const aaKey = rankerEnv.ARTIFICIAL_ANALYSIS_API_KEY ?? process.env.ARTIFICIAL_ANALYSIS_API_KEY
   const aa = aaKey ? await cached("aa", 20 * 3600e3, () => aaModels(aaKey), decodeAA, warnings) : []
   if (!aaKey) warnings.push("aa: ARTIFICIAL_ANALYSIS_API_KEY not set, Artificial Analysis scores skipped")
   const aaRows = (metric: string): Row[] => aa.map((m) => ({ name: m.name, value: m.evaluations[metric] }))
@@ -259,7 +327,7 @@ else {
     for (const w of r.warnings) console.log(`warning: ${w}`)
     if (!r.models.length) console.log("warning: no eligible free models found")
   } catch (e) {
-    console.error(`rank failed: ${errorText(e)}`)
+    console.error(`rank failed: ${redactSecrets(errorText(e))}`)
     process.exitCode = 1
   } finally {
     if (lock) fs.rmSync(lock, { force: true })

@@ -11,6 +11,7 @@ import { tempWithOpencode } from "./fixtures/fake-opencode.ts"
 
 const SCRIPTS = fileURLToPath(new URL("../scripts/", import.meta.url))
 const TEMPLATE = fs.readFileSync(new URL("../templates/free.jsonc", import.meta.url), "utf8")
+const POSIX_ONLY = process.platform === "win32" ? "these tests run install.sh/uninstall.sh; scripts-windows.test.ts covers the PowerShell scripts" : false
 
 function setup(t: TestContext, version = "opencode v2.0.32") {
   const root = tempWithOpencode(t, "free-router-scripts-", `#!/bin/sh\necho "${version}"\n`)
@@ -26,7 +27,7 @@ function script(name: string, root: string, args: string[]) {
 const install = (root: string, dir: string, ...extra: string[]) => script("install.sh", root, ["--dir", dir, "--no-rank", ...extra])
 const read = (dir: string, name: string) => fs.readFileSync(path.join(dir, name), "utf8")
 
-test("install refuses opencode 1.x and a version it cannot read", (t) => {
+test("install refuses opencode 1.x and a version it cannot read", { skip: POSIX_ONLY }, (t) => {
   for (const version of ["1.19.3", "not a version"]) {
     const { root, dir } = setup(t, version)
     const r = install(root, dir)
@@ -36,7 +37,7 @@ test("install refuses opencode 1.x and a version it cannot read", (t) => {
   }
 })
 
-test("a fresh install copies the plugin as a directory and writes the v2 config", (t) => {
+test("a fresh install copies the plugin as a directory and writes the v2 config", { skip: POSIX_ONLY }, (t) => {
   const { root, dir } = setup(t)
   const r = install(root, dir)
   assert.equal(r.status, 0, r.stderr)
@@ -47,7 +48,18 @@ test("a fresh install copies the plugin as a directory and writes the v2 config"
   assert.match(read(dir, "opencode-free"), /dir="\$\{FREE_ROUTER_DIR:-[^@]*\}"/, "install directory filled in")
 })
 
-test("an upgrade moves the old plugin entry, leaves comments and the rest alone, and removes the old code", (t) => {
+test("install copies an install directory with shell and sed metacharacters literally", { skip: POSIX_ONLY }, (t) => {
+  const { root } = setup(t)
+  const dir = path.join(root, 'a&b|c\\d$e"f`g')
+  const r = install(root, dir)
+  assert.equal(r.status, 0, r.stderr)
+  const path_ = [path.join(root, "bin"), path.dirname(process.execPath), "/usr/bin", "/bin"].join(":")
+  const run = spawnSync(path.join(dir, "opencode-free"), ["--list-models"], { encoding: "utf8", env: { PATH: path_, HOME: path.join(root, "home") } })
+  assert.equal(run.status, 0, run.stderr)
+  assert.equal(run.stdout, "free/auto\n", "the launcher found free.jsonc in that path")
+})
+
+test("an upgrade moves the old plugin entry, leaves comments and the rest alone, and removes the old code", { skip: POSIX_ONLY }, (t) => {
   const { root, dir } = setup(t)
   fs.mkdirSync(dir)
   for (const f of ["plugin.ts", "plugin.js", "lib.mjs", "rank.mjs"]) fs.writeFileSync(path.join(dir, f), "old")
@@ -76,7 +88,7 @@ test("an upgrade moves the old plugin entry, leaves comments and the rest alone,
   assert.doesNotMatch(again.stdout, /updated {2}.*free\.jsonc/)
 })
 
-test("a free.jsonc that does not load the plugin directory fails the install with the edit to make", (t) => {
+test("a free.jsonc that does not load the plugin directory fails the install with the edit to make", { skip: POSIX_ONLY }, (t) => {
   const cases: Record<string, [config: string, ok: boolean]> = {
     "an active plugins entry beside an indented commented old line": ['{\n    // "plugin": ["./plugin.ts"],\n  "plugins": ["./plugin"]\n}\n', true],
     "other plugins next to it": ['{ "plugins": ["other", "./plugin"] }\n', true],
@@ -98,7 +110,7 @@ test("a free.jsonc that does not load the plugin directory fails the install wit
   }
 })
 
-test("uninstall removes the plugin file and only an empty plugin directory", (t) => {
+test("uninstall removes the plugin file and only an empty plugin directory", { skip: POSIX_ONLY }, (t) => {
   const { root, dir } = setup(t)
   assert.equal(install(root, dir).status, 0)
   const r = script("uninstall.sh", root, ["--dir", dir])

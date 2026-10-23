@@ -112,6 +112,68 @@ export function decodeModel(v: unknown): ModelInfo | undefined {
 
 export const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
+// Provider errors and stack messages can quote a key. The router still needs the error class and
+// wording, never the credential, so every text it keeps or logs goes through this first. The shapes
+// are deliberately narrow: a phrase such as "token budget" is left alone.
+export function redactSecrets(text: string) {
+  return text
+    .replace(/\b(sk-[A-Za-z0-9._-]{6,})/g, "sk-***")
+    .replace(/\b(xox[baprs]-[A-Za-z0-9-]{10,})/g, "xox*-***")
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1***")
+    .replace(
+      /(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|authorization|token|secret|password)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+      "$1***",
+    )
+    .replace(/([?&](?:api[_-]?key|access[_-]?token|token|key)=)[^&\s]+/gi, "$1***")
+}
+
+// ---------- executables ----------
+
+// Find a command the way the platform's own loader does. On Windows a bare name is not runnable:
+// the file on PATH carries one of PATHEXT's extensions (node.exe, opencode.cmd, ...), while POSIX
+// uses the name itself. fs.accessSync(X_OK) is the best check Node offers on both.
+export function findExecutable(bin: string, pathValue = process.env.PATH ?? "", platform = process.platform) {
+  const extensions = platform === "win32" ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean) : [""]
+  const separator = path.delimiter
+  const seen = new Set<string>()
+  for (const raw of pathValue.split(separator)) {
+    if (!raw) continue
+    // Windows accepts a quoted PATH entry ("C:\Program Files\..."), and some installers write one.
+    const dir = platform === "win32" && /^".*"$/.test(raw) ? raw.slice(1, -1) : raw
+    if (!dir) continue
+    for (const extension of extensions) {
+      const candidate = path.join(dir, bin + extension)
+      const identity = platform === "win32" ? candidate.toLowerCase() : candidate
+      if (seen.has(identity)) continue
+      seen.add(identity)
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK)
+        // On Windows X_OK is F_OK, so a directory named opencode.exe would otherwise look runnable.
+        if (fs.statSync(candidate).isFile()) return candidate
+      } catch {
+        // not this directory
+      }
+    }
+  }
+  return undefined
+}
+
+// A Windows command line for `cmd.exe /d /v:off /s /c`. `.cmd`/`.bat` files cannot be started
+// directly by CreateProcess, so rank.mts (npm's opencode.cmd) and the plugin (a test or wrapper
+// shim) need this. Every word is double-quoted, and a literal quote is written as "" because cmd.exe
+// (unlike the C runtime) does not treat a backslash as an escape. The caller wraps the result in one
+// more pair of quotes, cmd.exe's documented `/s /c "..."` form. Quoting protects spaces and
+// `&|<>^()`; `/v:off` keeps `!` literal. A literal quote becomes "", and a trailing backslash is
+// doubled so the C runtime at the end of npm's `%*` chain does not turn it into a quote. cmd.exe
+// still expands `%VAR%` (there is no reliable escape through npm's `%*` shim), so callers pass fixed
+// argv words and already-resolved paths, never shell syntax.
+export function windowsCommandLine(file: string, args: readonly string[]) {
+  const quote = (s: string) => `"${s.replace(/"/g, '""').replace(/(\\+)$/, "$1$1")}"`
+  return [quote(file), ...args.map(quote)].join(" ")
+}
+
+export const needsCommandShell = (file: string, platform = process.platform) => platform === "win32" && /\.(?:cmd|bat)$/i.test(file)
+
 // ---------- files ----------
 
 // undefined when the file is missing or not JSON.
@@ -125,8 +187,21 @@ export function readJSON(file: string): unknown {
 
 export function writeJSONAtomic(file: string, data: unknown) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 })
-  fs.renameSync(tmp, file)
+  // 0600 is a POSIX permission. Windows has no mode bits for privacy: Node only maps the write bit
+  // to the read-only attribute, and these files inherit the user's profile ACL (owner, SYSTEM and
+  // Administrators only), which is the real Windows guarantee.
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 })
+    fs.renameSync(tmp, file)
+  } catch (e) {
+    // An interrupted or failed write must not leave a partial file that looks like state.
+    try {
+      fs.rmSync(tmp, { force: true })
+    } catch {
+      // best effort
+    }
+    throw e
+  }
 }
 
 export type CooldownClass = "quota" | "rate" | "server" | "unavailable"
@@ -533,7 +608,8 @@ export function coolingUntil(state: Pick<State, "cooldowns">, id: string, now = 
 export function orderCandidates(ranked: readonly string[], live: ModelInfo[], cfg: Config, pins: Pins) {
   const liveEligible = new Map<string, ModelInfo>()
   for (const m of live) if (isEligible(m, cfg, pins)) liveEligible.set(key(m), m)
-  const ordered = ranked.filter((id) => liveEligible.has(id))
+  // A hand-edited ranking may repeat an id; picking the same model twice is still one candidate.
+  const ordered = [...new Set(ranked.filter((id) => liveEligible.has(id)))]
   const rest = [...liveEligible.values()]
     .filter((m) => !ordered.includes(key(m)))
     .sort((a, b) => (b.release_date ?? "").localeCompare(a.release_date ?? ""))

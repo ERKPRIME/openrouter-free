@@ -1,10 +1,60 @@
 # Changelog
 
-Add entries under `## Unreleased`. The next push to `master` that changes shipped code cuts a
-release: the release workflow moves them under the new version, tags it and publishes the GitHub
-release. A `[minor]` or `[major]` marker in a commit subject picks the bump; otherwise it is a patch.
+Add entries under `## Unreleased`. The upstream project cuts a release on every push to its `master`
+that changes shipped code: the release workflow moves entries under the new version, tags it and
+publishes the GitHub release. A `[minor]` or `[major]` marker in a commit subject picks the bump;
+otherwise it is a patch. This fork uses `master`, so its release workflow only runs when started
+manually from the Actions tab.
 
 ## Unreleased
+
+- The retry hook now logs the model, the attempt and opencode's own decision before it acts, and
+  says when it ignores a retry because the session's model is not the router's pick (a manual
+  `/model`, a lost pick). A provider failure that never reaches the router - a stream that fails
+  already past its first token, or a hook opencode never calls - now leaves a trace in `router.log`
+  instead of returning silently, so a missing failover can be told apart from a failover that was
+  never asked for.
+
+- Native Windows support: `install-windows.ps1` and `uninstall-windows.ps1`, their `.cmd`
+  Command Prompt/Explorer wrappers, plus a PowerShell launcher (`bin/opencode-free.ps1`, installed as
+  `opencode-free-launcher.ps1`) and a `.cmd` shim. They mirror the POSIX install/upgrade/uninstall
+  behavior, keep user config and keys untouched, and make the `opencode-free` shim work from any
+  directory. The shim is relative (`%~dp0`), and the rendered PowerShell launcher is UTF-8 with BOM,
+  so install paths with accents or other non-ASCII characters work. The launcher does not use the
+  `opencode-free` name, so PowerShell runs the `.cmd` as a child process instead of dot-sourcing the
+  `.ps1` and leaking `OPENCODE_CONFIG`/`FREE_ROUTER_DIR` into the session. The tests run the
+  PowerShell scripts against a temporary install directory and exercise both `.cmd` entry points.
+- The Windows installer moves the shim directory to the front of the user PATH with
+  `scripts/windows-path.ps1`. The helper keeps the semicolons between entries (a string-plus-array
+  bug had joined the first two paths), and a test covers spaces, duplicates and an empty PATH.
+- `rank.mts` finds npm's `opencode.cmd` on Windows and runs `.cmd`/`.bat` shims through `cmd.exe`
+  with quoted argv, instead of `spawnSync(..., { shell: true })` (which triggers Node's DEP0190 and
+  does not escape arguments). The plugin's runtime lookup likewise finds `node.exe`/`bun.exe` by
+  `PATHEXT` on Windows.
+- Windows has no permission bits for privacy: the mode tests now check the inherited user-profile
+  ACL on Windows and keep the `0600` assertions on POSIX.
+- Hardened the router and installers after an independent review:
+  - `rank.mts` no longer leaks `ranker.env` into opencode's environment and removes the Artificial
+    Analysis key from the child process that lists models. Plugin log lines are timestamped; errors,
+    warnings and cooldown reasons are redacted; logs rotate and are mode `0600` on POSIX. Cache
+    parsing is BOM-tolerant, drops malformed entries and treats future timestamps as stale.
+  - Leaderboard pagination is capped, ranked IDs are deduplicated, and atomic writes clean up their
+    temporary file on failure.
+  - The plugin detects cyclic parent/fork graphs, limits retry waits, and handles background-refresh
+    spawn/lock errors without breaking a session.
+  - Windows installs write a `.opencode-free-router.json` marker (`complete: false` while copying),
+    refuse protected paths, the repository, junctions/symlinks and unrelated non-empty directories,
+    and restrict user files to the current user, `SYSTEM` and `Administrators` where ACLs are
+    available. Re-applying an already-correct ACL no longer warns.
+  - `uninstall-windows.ps1 -Purge` requires a valid marker; `-Force` is the explicit legacy escape
+    hatch. A normal uninstall removes only known code, an empty plugin directory and a shim owned by
+    this install.
+  - The PowerShell launcher passes `.cmd`/`.bat` targets through `cmd.exe` with explicit quoting,
+    preserves `&|<>^!`, embedded quotes, empty arguments, trailing backslashes and Unicode, reports a
+    missing `opencode` with exit 127, and does not leak the router environment into the caller's
+    shell. `%NAME%` expansion and newlines remain documented `cmd.exe` limitations.
+  - `install.sh` escapes shell and sed metacharacters in `--dir`; coverage runs on Node 22/24 as well
+    as Node 26 (using `--test-coverage-include-all` only where supported).
 
 ## 0.1.3 — 2026-10-19
 
