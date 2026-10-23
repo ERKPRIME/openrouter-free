@@ -63,7 +63,9 @@ const RUNS: [args: string[], argv: string[]][] = [
   [["runn", "hello"], ["--standalone", "runn", "hello"]],
 ]
 
-test("each command line gets --standalone where opencode takes it", (t) => {
+const POSIX_ONLY = process.platform === "win32" ? "bin/opencode-free is the POSIX launcher; launcher-windows.test.ts covers opencode-free.ps1" : false
+
+test("each command line gets --standalone where opencode takes it", { skip: POSIX_ONLY }, (t) => {
   const dir = setup(t)
   for (const [args, argv] of RUNS) {
     const r = launch(dir, args)
@@ -72,13 +74,13 @@ test("each command line gets --standalone where opencode takes it", (t) => {
   }
 })
 
-test("opencode starts with the router's config and the provider keys", (t) => {
+test("opencode starts with the router's config and the provider keys", { skip: POSIX_ONLY }, (t) => {
   const dir = setup(t)
   const r = launch(dir, ["run", "x"])
   assert.deepEqual(r.started?.slice(0, 3), [path.join(dir, "free.jsonc"), dir, "abc"])
 })
 
-test("commands that manage the shared background service are refused, with the plain command to run", (t) => {
+test("commands that manage the shared background service are refused, with the plain command to run", { skip: POSIX_ONLY }, (t) => {
   const dir = setup(t)
   for (const cmd of ["debug", "pair", "mcp", "plugin", "upgrade", "update", "uninstall"]) {
     for (const args of [[cmd], [cmd, "list"], ["--log-level", "debug", cmd]]) {
@@ -93,7 +95,7 @@ test("commands that manage the shared background service are refused, with the p
   assert.deepEqual(launch(dir, ["run", "debug it"]).argv, ["run", "--standalone", "debug it"])
 })
 
-test("the shared background service is refused, with a hint when the word is part of a message", (t) => {
+test("the shared background service is refused, with a hint when the word is part of a message", { skip: POSIX_ONLY }, (t) => {
   const dir = setup(t)
   const refused = /^opencode-free: can't run the shared background service, and refuses --service anywhere in the arguments \(quote it inside a message\); use opencode-free for the TUI or opencode-free acp for editors and bb\n$/
   for (const args of [["service"], ["service", "restart"], ["serve", "--service"], ["serve", "--service=true"], ["--service=1"], ["--agent", "--service"], ["--log-level", "--service"], ["--agent", "run", "service"], ["--log-level", "debug", "service", "stop"]]) {
@@ -110,7 +112,7 @@ test("the shared background service is refused, with a hint when the word is par
   }
 })
 
-test("--list-models answers without starting opencode, and a missing config is an error", (t) => {
+test("--list-models answers without starting opencode, and a missing config is an error", { skip: POSIX_ONLY }, (t) => {
   const dir = setup(t)
   const r = launch(dir, ["--list-models"])
   assert.equal(r.stdout, "free/auto\n")

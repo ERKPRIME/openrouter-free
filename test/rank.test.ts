@@ -12,12 +12,34 @@ import { tempWithOpencode } from "./fixtures/fake-opencode.ts"
 
 const RANK = fileURLToPath(new URL("../src/rank.mts", import.meta.url))
 const STUB = new URL("./fixtures/fetch-stub.ts", import.meta.url).href
+const WINDOWS = process.platform === "win32"
 
 const FAKE_OPENCODE = `#!/bin/sh
 printf '%s|%s|%s\\n' "$OPENCODE_CONFIG" "$FREE_ROUTER_RANKING" "$FOO_KEY" > "$FREE_ROUTER_DIR/opencode-env"
+printf '%s' "\${ARTIFICIAL_ANALYSIS_API_KEY-unset}" > "$FREE_ROUTER_DIR/opencode-aa"
 printf '%s\\n' "$*" > "$FREE_ROUTER_DIR/opencode-argv"
-if [ -n "$FAKE_OPENCODE_FAIL" ]; then echo "boom" >&2; exit 1; fi
+if [ -n "$FAKE_OPENCODE_FAIL" ]; then echo "\${FAKE_OPENCODE_FAIL_TEXT:-boom}" >&2; exit 1; fi
 cat "$FREE_ROUTER_DIR/models.txt"
+`
+
+// The Windows opencode.cmd starts the same recording logic through node; rank.mts must find the
+// .cmd by PATHEXT and run it through cmd.exe.
+const FAKE_OPENCODE_JS = `
+import fs from "node:fs"
+import path from "node:path"
+const dir = process.env.FREE_ROUTER_DIR
+fs.writeFileSync(path.join(dir, "opencode-env"), \`\${process.env.OPENCODE_CONFIG}|\${process.env.FREE_ROUTER_RANKING}|\${process.env.FOO_KEY}\\n\`)
+fs.writeFileSync(path.join(dir, "opencode-aa"), process.env.ARTIFICIAL_ANALYSIS_API_KEY ?? "unset")
+fs.writeFileSync(path.join(dir, "opencode-argv"), process.argv.slice(2).join(" ") + "\\n")
+if (process.env.FAKE_OPENCODE_FAIL) {
+  process.stderr.write((process.env.FAKE_OPENCODE_FAIL_TEXT || "boom") + "\\n")
+  process.exit(1)
+}
+process.stdout.write(fs.readFileSync(path.join(dir, "models.txt"), "utf8"))
+`
+const FAKE_OPENCODE_WIN = `@echo off
+"${process.execPath}" "%~dp0opencode-fake.mjs" %*
+exit /b %errorlevel%
 `
 
 // A model.list entry, with the fields that can hold credentials filled in.
@@ -32,6 +54,8 @@ const model = (providerID: string, id: string, extra: Record<string, unknown> = 
   capabilities: { tools: true },
   headers: { authorization: "Bearer sk-secret-header" },
   settings: { apiKey: "sk-secret-setting" },
+  provider: { settings: { apiKey: "NESTED-SECRET" }, headers: { authorization: "Bearer NESTED-BEARER" }, keep: "provider" },
+  list: [{ token: "NESTED-TOKEN", keep: "list" }],
   variants: [{ id: "high", headers: { "x-key": "sk-secret-variant" }, body: { reasoning: "high" }, settings: { token: "sk-secret-variant" } }],
   ...extra,
 })
@@ -56,17 +80,24 @@ const ROUTES = [
   { match: "openrouter.ai/api/v1/models", body: { data: [{ id: "stealth/space-bunny-alpha", name: "Space Bunny Alpha" }, { id: "stealth/quiet-fox", name: "" }, { id: "meta/llama" }] } },
 ]
 
-const setup = (t: TestContext) => tempWithOpencode(t, "free-router-rank-", FAKE_OPENCODE)
+const setup = (t: TestContext) => {
+  const dir = tempWithOpencode(t, "free-router-rank-", FAKE_OPENCODE, FAKE_OPENCODE_WIN)
+  if (WINDOWS) fs.writeFileSync(path.join(dir, "bin", "opencode-fake.mjs"), FAKE_OPENCODE_JS)
+  return dir
+}
 
 function run(dir: string, args: string[] = [], { routes = ROUTES, models = MODELS, env = {} }: { routes?: unknown[]; models?: string; env?: Record<string, string> } = {}) {
   fs.writeFileSync(path.join(dir, "routes.json"), JSON.stringify(routes))
   fs.writeFileSync(path.join(dir, "models.txt"), models)
   const base = { ...process.env }
   delete base.ARTIFICIAL_ANALYSIS_API_KEY
+  const search = WINDOWS
+    ? [path.join(dir, "bin"), path.join(process.env.SystemRoot ?? "C:\\Windows", "System32")].join(path.delimiter)
+    : `${path.join(dir, "bin")}:/usr/bin:/bin`
   return spawnSync(process.execPath, ["--import", STUB, RANK, ...args], {
     cwd: dir,
     encoding: "utf8",
-    env: { ...base, FREE_ROUTER_DIR: dir, FETCH_STUB: path.join(dir, "routes.json"), PATH: `${path.join(dir, "bin")}:/usr/bin:/bin`, ...env },
+    env: { ...base, FREE_ROUTER_DIR: dir, FETCH_STUB: path.join(dir, "routes.json"), PATH: search, ...env },
   })
 }
 
@@ -75,7 +106,7 @@ const rankedModels = (dir: string) => list(readRanking(dir).models, asObject)
 
 test("refresh ranks eligible models from every source, then serves from cache", (t) => {
   const dir = setup(t)
-  fs.writeFileSync(path.join(dir, "providers.env"), "# provider keys\nexport FOO_KEY='abc'\nEMPTY=\n\nnot a line\n")
+  fs.writeFileSync(path.join(dir, "providers.env"), "# provider keys\nexport FOO_KEY='abc'\nARTIFICIAL_ANALYSIS_API_KEY='k'\nEMPTY=\n\nnot a line\n")
   fs.writeFileSync(path.join(dir, "ranker.env"), 'ARTIFICIAL_ANALYSIS_API_KEY="k"\n')
 
   const r = run(dir, ["--config", "free.jsonc"])
@@ -83,6 +114,9 @@ test("refresh ranks eligible models from every source, then serves from cache", 
   assert.match(r.stdout, /^ranked 2 free models; top: opencode\/big-free, opencode\/space-bunny-free$/m)
   assert.match(r.stdout, /^warning: arena_text: 500 Server Error for https:\/\/datasets-server\.huggingface\.co\/rows \(no previous copy\)$/m)
   assert.equal(fs.readFileSync(path.join(dir, "opencode-env"), "utf8"), `${path.join(dir, "free.jsonc")}|1|abc\n`, "config, recursion guard and providers.env reach opencode")
+  // ranker.env is for the ranker itself. The Artificial Analysis key, even when it is also in
+  // providers.env, must not reach the opencode child and its provider plugins.
+  assert.equal(fs.readFileSync(path.join(dir, "opencode-aa"), "utf8"), "unset", "the AA key is not passed to opencode")
 
   assert.equal(fs.readFileSync(path.join(dir, "opencode-argv"), "utf8"), "api --standalone model.list\n")
   assert.equal(readRanking(dir).candidatesSeen, 3, "entries that are not models are skipped")
@@ -98,7 +132,12 @@ test("refresh ranks eligible models from every source, then serves from cache", 
   const kept = asArray(readJSON(path.join(dir, "cache", "candidates.json")))
   assert.equal(kept.length, 3)
   assert.ok(!JSON.stringify(kept).includes("sk-secret"), "no credential reaches the cache")
+  assert.ok(!JSON.stringify(kept).includes("NESTED-SECRET"), "a nested secret is stripped too")
+  assert.ok(!JSON.stringify(kept).includes("NESTED-BEARER"), "nested request headers are stripped")
+  assert.ok(!JSON.stringify(kept).includes("NESTED-TOKEN"), "nested token fields are stripped")
   assert.deepEqual(Object.keys(asObject(kept[0])).filter((k) => ["headers", "body", "settings"].includes(k)), [])
+  assert.deepEqual(asObject(asObject(kept[0]).provider), { keep: "provider" }, "unknown nested fields survive")
+  assert.deepEqual(asObject(asArray(asObject(kept[0]).list)[0]), { keep: "list" })
   assert.deepEqual(asObject(asArray(asObject(kept[0]).variants)[0]), { id: "high" }, "variants lose theirs too")
   assert.deepEqual(
     list(asObject(readJSON(path.join(dir, "cache", "arena_agent.json"))).data, (r) => optString(asObject(r).name)),
@@ -118,6 +157,13 @@ test("refresh ranks eligible models from every source, then serves from cache", 
   const stale = run(dir, ["--quiet"], { routes: [] })
   assert.match(stale.stdout, /^warning: arena_agent: no stub for .* \(using copy from \d{4}-\d\d-\d\dT.*Z\)$/m)
   assert.ok(asObject(rankedModels(dir)[0]?.sources).arena_agent)
+
+  // A cache timestamp in the future is a bad clock or a hand-edited file, not a reason to trust the
+  // copy until the clock catches up.
+  fs.writeFileSync(file, JSON.stringify({ ...asObject(readJSON(file)), fetchedAt: Date.now() + 10 * 3600e3 }))
+  const future = run(dir, ["--quiet"], { routes: [] })
+  assert.equal(future.status, 0, future.stderr)
+  assert.match(future.stdout, /^warning: arena_agent: no stub for .* \(using copy from \d{4}-\d\d-\d\dT.*Z\)$/m)
 })
 
 test("refresh without an AA key or eligible models still writes a ranking and frees the lock", (t) => {
@@ -146,7 +192,7 @@ test("refresh fails cleanly when opencode fails or is missing", (t) => {
 
   const missing = run(dir, [], { env: { PATH: path.join(dir, "nowhere") } })
   assert.equal(missing.status, 1)
-  assert.match(missing.stderr, /^rank failed: opencode model.list failed: spawnSync opencode ENOENT$/m)
+  assert.match(missing.stderr, WINDOWS ? /opencode.*(?:not recognized|not found)|ENOENT/i : /^rank failed: opencode model\.list failed: spawnSync opencode ENOENT$/m)
   assert.ok(!fs.existsSync(path.join(dir, "ranking.json")))
 })
 
@@ -156,6 +202,10 @@ test("refresh reads the model list however opencode prints it", (t) => {
   const ok = run(dir, [], { models: pretty })
   assert.equal(ok.status, 0, ok.stderr)
   assert.match(ok.stdout, /^ranked 1 free models; top: opencode\/big-free$/m)
+
+  const bom = run(dir, [], { models: `\uFEFF${JSON.stringify({ data: [model("opencode", "big-free")] })}` })
+  assert.equal(bom.status, 0, bom.stderr)
+  assert.match(bom.stdout, /^ranked 1 free models; top: opencode\/big-free$/m, "a UTF-8 BOM does not hide the list")
 
   const none = run(dir, [], { models: "nothing to see\n" })
   assert.equal(none.status, 1)
@@ -203,4 +253,44 @@ test("--status prints the ranking, cooldowns and recent sessions", (t) => {
   assert.equal(line(8), "recent sessions:")
   assert.match(line(9), /^ {2}ses_new {2}opencode\/big-free {2}\(.+\)$/, "newest first")
   assert.match(line(10), /^ {2}ses_old {2}groq\/fast/)
+})
+
+test("rank validates its command line before touching the network", (t) => {
+  const dir = setup(t)
+
+  const help = run(dir, ["--help"])
+  assert.equal(help.status, 0, help.stderr)
+  assert.match(help.stdout, /^Usage: rank\.mts \[options\]$/m)
+  assert.match(help.stdout, /--status/)
+  assert.doesNotMatch(help.stdout, /rank failed/)
+
+  for (const [args, message] of [
+    [["--nope"], "rank: unknown option '--nope' (see --help)"],
+    [["stray"], "rank: unexpected argument 'stray' (see --help)"],
+    [["--config"], "rank: --config needs a value"],
+    [["--lock"], "rank: --lock needs a value"],
+  ] as const) {
+    const r = run(dir, [...args])
+    assert.equal(r.status, 2, args.join(" "))
+    assert.equal(r.stderr, `${message}\n`, args.join(" "))
+    assert.equal(r.stdout, "", args.join(" "))
+  }
+})
+
+test("rank redacts a credential that opencode prints in its error", (t) => {
+  const dir = setup(t)
+  const secret = "sk-abcDEF123456"
+  const r = run(dir, [], { env: { FAKE_OPENCODE_FAIL: "1", FAKE_OPENCODE_FAIL_TEXT: `boom ${secret}` } })
+  assert.equal(r.status, 1)
+  assert.equal(r.stderr, "rank failed: opencode model.list failed: boom sk-***\n\n")
+  assert.ok(!r.stderr.includes(secret))
+})
+
+test("a leaderboard that never ends is stopped instead of paging forever", (t) => {
+  const dir = setup(t)
+  const endless = [{ match: "config=agent", body: { num_rows_total: 1_000_000, rows: [overall("big-model", "score", 1500)] } }]
+  const r = run(dir, [], { routes: endless })
+  assert.equal(r.status, 0, r.stderr)
+  assert.match(r.stdout, /^warning: arena_agent: agent: leaderboard pagination did not end \(no previous copy\)$/m)
+  assert.ok(fs.existsSync(path.join(dir, "ranking.json")), "the refresh finishes without that source")
 })

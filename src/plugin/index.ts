@@ -24,6 +24,10 @@ import {
   asObject,
   optString,
   errorText,
+  redactSecrets,
+  findExecutable,
+  windowsCommandLine,
+  needsCommandShell,
 } from "../lib.mts"
 import type { Config, Failover, ModelInfo, State } from "../lib.mts"
 
@@ -93,7 +97,10 @@ const LOG = path.join(DIR, "router.log")
 const LIVE_TTL = 5 * 60e3
 
 // The log is created 0600, but one from an older install or a rotation keeps the mode it had.
+// On Windows 0600 is not a privacy setting (Node only maps the write bit); the file inherits the
+// user's profile ACL, which grants the owner, SYSTEM and Administrators only.
 function secureLog() {
+  if (process.platform === "win32") return
   for (const f of [LOG, `${LOG}.1`]) {
     try {
       fs.chmodSync(f, 0o600)
@@ -110,7 +117,12 @@ function log(msg: string) {
       fs.renameSync(LOG, `${LOG}.1`)
       secureLog()
     }
-    fs.appendFileSync(LOG, `${new Date().toISOString()} ${msg}\n`, { mode: 0o600 })
+    // Timestamp every line, not just the first: a provider message with a newline must not be able to
+    // forge a log entry. Redaction happens here as the last line of defence, so a key cannot reach a
+    // reply that is kept or shared.
+    const at = new Date().toISOString()
+    const text = redactSecrets(msg).replace(/\r/g, "").split("\n").map((line) => `${at} ${line}\n`).join("")
+    fs.appendFileSync(LOG, text, { mode: 0o600 })
   } catch {
     // a log that cannot be written is not worth crashing over
   }
@@ -126,16 +138,7 @@ function update(fn: (mine: State) => void) {
 }
 
 function which(bin: string) {
-  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
-    const p = path.join(dir, bin)
-    try {
-      fs.accessSync(p, fs.constants.X_OK)
-      return p
-    } catch {
-      // not this directory
-    }
-  }
-  return undefined
+  return findExecutable(bin)
 }
 
 // Re-rank in the background when ranking.json is missing or stale. process.execPath is the
@@ -159,11 +162,51 @@ function maybeRefresh(cfg: Config) {
     log("WARN ranking is stale but neither node nor bun is on PATH; run rank.mts manually")
     return
   }
-  const out = fs.openSync(LOG, "a", 0o600)
-  const child = spawn(runtime, [path.join(DIR, "rank.mts"), "--quiet", "--lock", lock], {
-    detached: true,
-    stdio: ["ignore", out, out],
-    env: { ...process.env, FREE_ROUTER_DIR: DIR },
+  const releaseLock = () => {
+    try {
+      // Do not delete a lock another process took over after calling ours abandoned.
+      if (fs.readFileSync(lock, "utf8") === String(process.pid)) fs.rmSync(lock, { force: true })
+    } catch {
+      // already gone
+    }
+  }
+  let out: number
+  try {
+    out = fs.openSync(LOG, "a", 0o600)
+  } catch (e) {
+    releaseLock()
+    log(`refresh check failed: cannot open ${LOG}: ${errorText(e)}`)
+    return
+  }
+  const args = [path.join(DIR, "rank.mts"), "--quiet", "--lock", lock]
+  let child
+  try {
+    child = needsCommandShell(runtime)
+      ? spawn(process.env.ComSpec || "cmd.exe", ["/d", "/v:off", "/s", "/c", `"${windowsCommandLine(runtime, args)}"`], {
+          detached: true,
+          stdio: ["ignore", out, out],
+          env: { ...process.env, FREE_ROUTER_DIR: DIR },
+          windowsVerbatimArguments: true,
+        })
+      : spawn(runtime, args, {
+          detached: true,
+          stdio: ["ignore", out, out],
+          env: { ...process.env, FREE_ROUTER_DIR: DIR },
+        })
+  } catch (e) {
+    fs.closeSync(out)
+    releaseLock()
+    log(`could not start rank.mts: ${errorText(e)}`)
+    return
+  }
+  // A spawn failure is asynchronous on Windows. Without this handler an ENOENT can crash opencode,
+  // and the lock would keep future refreshes out for ten minutes.
+  child.once("error", (e) => {
+    releaseLock()
+    log(`rank.mts could not start: ${errorText(e)}`)
+  })
+  child.once("exit", (code) => {
+    if (code !== 0) releaseLock()
   })
   child.unref()
   fs.closeSync(out)
@@ -257,11 +300,19 @@ function createSessions(ctx: RouterContext, chooser: Chooser) {
     return d ? idOf(d) : undefined
   }
 
-  // A deleted parent or fork source is nobody's pick.
-  async function originOnPick(origin: string, model: string) {
+  // A deleted parent or fork source is nobody's pick. `seen` also makes a corrupt session graph
+  // (A is B's parent and B is A's) terminate instead of recursing forever.
+  async function originOnPick(origin: string, model: string, seen: Set<string>) {
+    if (seen.has(origin)) return false
+    seen.add(origin)
     if (stickyOf(origin) === model) return true
     try {
-      return metaPick(await info(origin)) === model
+      const infoOf = await info(origin)
+      if (metaPick(infoOf) === model) return true
+      for (const next of [infoOf.parentID, infoOf.fork?.sessionID]) {
+        if (next && (await originOnPick(next, model, seen))) return true
+      }
+      return false
     } catch (e) {
       log(`session ${origin} lookup failed: ${errorText(e).slice(0, 200)}`)
       return false
@@ -275,8 +326,9 @@ function createSessions(ctx: RouterContext, chooser: Chooser) {
     if (stickyOf(sid) === model) return true
     const own = known ?? (await info(sid))
     if (metaPick(own) === model) return true
+    const seen = new Set([sid])
     for (const origin of [own.parentID, own.fork?.sessionID]) {
-      if (origin && (await originOnPick(origin, model))) return true
+      if (origin && (await originOnPick(origin, model, seen))) return true
     }
     return false
   }
@@ -302,7 +354,7 @@ function createFailover(cfg: Config, chooser: Chooser, sessions: Sessions) {
     const sid = e.sessionID
     const coolKey = c.scope === "provider" ? `${from.split("/")[0]}/*` : from
     update((s) => {
-      s.cooldowns[coolKey] = { until: Date.now() + c.cooldownMs, klass: c.klass, reason: message.slice(0, 200) }
+      s.cooldowns[coolKey] = { until: Date.now() + c.cooldownMs, klass: c.klass, reason: redactSecrets(message).slice(0, 200) }
     })
     // Whatever stops the switch from here on, the error surfaces now instead of opencode's own wait.
     e.decision = { retry: false }
@@ -359,6 +411,7 @@ function createRouter(cfg: Config, turns: TurnBook, chooser: Chooser, sessions: 
     const sid = e.sessionID
     const t = turns.of(sid)
     const from = idOf(e.model)
+    log(`retry hook ${sid}: ${from} attempt ${e.attempt}, opencode proposes ${e.decision.retry ? "retry" : "stop"}`)
     // A request still on a model this execution already left (a compaction keeps the model it started
     // with) or on free/auto after its pick: the first one is retried, in case it is the primary request
     // that lost the race to the switch, the next ones are let fail, since retrying only hits the
@@ -383,7 +436,10 @@ function createRouter(cfg: Config, turns: TurnBook, chooser: Chooser, sessions: 
       e.decision = { retry: true, delay: 0 }
       return
     }
-    if (!(await sessions.onPick(sid, from))) return
+    if (!(await sessions.onPick(sid, from))) {
+      log(`retry hook ${sid}: ${from} is not this session's pick; routing is off, no failover`)
+      return
+    }
     const { error } = e
     const c = classifyFailure(
       { type: error.type, message: error.message, status: error.status, body: error.response?.body, attempt: Math.max(1, e.attempt - t.attemptAtSwitch), delay: e.decision.retry ? e.decision.delay : 0 },

@@ -32,6 +32,35 @@ jobs:
       - run: npm run check
       - run: npm test
 
+  # The Windows-specific tests only run here. The POSIX tests skip themselves on win32, and the
+  # PowerShell launcher/installer tests run for real.
+  windows:
+    name: test on Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm test
+
+  # Keep the original POSIX path covered on macOS too, not just on Linux.
+  macos:
+    name: test on macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm test
+
   # Separate from the matrix: --test-coverage-include-all is Node 26+, and without
   # it files no test imports are left out of the report instead of counting as 0%.
   coverage:
