@@ -1,7 +1,11 @@
 # opencode-free-router
 
 [![ci](https://github.com/ERKPRIME/openrouter-free/actions/workflows/ci.yml/badge.svg)](https://github.com/ERKPRIME/openrouter-free/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/openrouter-free.svg)](https://www.npmjs.com/package/openrouter-free)
+[![npm downloads](https://img.shields.io/npm/dm/openrouter-free.svg)](https://www.npmjs.com/package/openrouter-free)
 [![Coverage Status](https://coveralls.io/repos/github/ERKPRIME/openrouter-free/badge.svg?branch=master)](https://coveralls.io/github/ERKPRIME/openrouter-free?branch=master)
+
+> **Install now:** `npm install -g openrouter-free` — run `openrouter-free` from any directory. [View on npm](https://www.npmjs.com/package/openrouter-free).
 
 An [opencode](https://opencode.ai) plugin that always runs on the **best free model available right
 now**, so you never have to track which free models exist this week.
